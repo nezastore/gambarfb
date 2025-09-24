@@ -213,13 +213,22 @@ def fit_to_canvas(clip: VideoFileClip, W: int, H: int) -> CompositeVideoClip:
 
 # ---------- built-in BG ----------
 def generate_builtin_bg(duration: float, W: int, H: int, fps: int = 30) -> str:
+    """
+    Background abstrak gradient-anim tanpa audio.
+    Diperbaiki: semua channel RGB berbentuk (H, W) → aman untuk np.stack.
+    """
     def make_frame(t):
-        y = np.linspace(0, 1, H).reshape(H, 1)
-        x = np.linspace(0, 1, W).reshape(1, W)
-        r = 60 + 40*np.sin(2*np.pi*(x*0.6 + t*0.05))
-        g = 60 + 40*np.sin(2*np.pi*(y*0.6 + t*0.07))
-        b = 120 + 80*np.sin(2*np.pi*(x*0.3 + y*0.3 + t*0.04))
-        return np.stack([r, g, b], axis=2).astype(np.uint8)
+        yy, xx = np.meshgrid(
+            np.linspace(0, 1, H), np.linspace(0, 1, W), indexing="ij"
+        )  # yy, xx: (H, W)
+
+        r = 60 + 40*np.sin(2*np.pi*(xx*0.6 + t*0.05))
+        g = 60 + 40*np.sin(2*np.pi*(yy*0.6 + t*0.07))
+        b = 120 + 80*np.sin(2*np.pi*(xx*0.3 + yy*0.3 + t*0.04))
+
+        frame = np.stack([r, g, b], axis=2)
+        frame = np.clip(frame, 0, 255).astype(np.uint8)
+        return frame
 
     clip = VideoClip(make_frame, duration=duration).resize((W, H))
     out_path = os.path.join(tempfile.mkdtemp(prefix="bg_"), "builtin_bg.mp4")
