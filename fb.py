@@ -6,10 +6,11 @@ Telegram bot: Viral News / Fakta Unik -> Video Overlay (Shorts) + FULL Button UI
 - Queue render + carousel judul/hashtag
 - Auto-resize ke kanvas vertikal 9:16 (default 1080x1920)
 - Kompatibel Pillow 10+ (shim Resampling untuk MoviePy)
-- Kirim video streamable (yuv420p + faststart)
+- Durasi output = PERSIS durasi video background
+- Kirim video streamable (yuv420p + faststart) + bawa audio
 """
 
-import os, re, json, uuid, tempfile, asyncio, textwrap
+import os, re, json, uuid, tempfile, asyncio, textwrap, math
 from datetime import datetime, timezone
 from typing import List, Dict, Tuple
 
@@ -26,7 +27,7 @@ if not GEMINI_API_KEY:
 # ====== Imports lib ======
 import feedparser, requests, numpy as np
 from PIL import Image, ImageDraw, ImageFont
-# ---- Pillow 10+ compatibility shim for MoviePy (ANTIALIAS removed)
+# ---- Pillow 10+ compatibility shim (ANTIALIAS dihapus)
 try:
     from PIL import Image as _PILImage
     if not hasattr(Image, "ANTIALIAS"):
@@ -61,14 +62,14 @@ def pick_gemini_model() -> str:
 GEMINI_MODEL = pick_gemini_model()
 
 # ====== State ======
-SESSION: Dict[int, Dict[str, str]] = {}   # per chat: video_path, mode, lang, dur, variants
+# per chat: video_path, mode, lang, variants
+SESSION: Dict[int, Dict[str, str]] = {}
 JOB_QUEUE: "asyncio.Queue[dict]" = asyncio.Queue()
 WORKER_STARTED = False
 
 # ====== Defaults ======
 DEF_MODE = "news"     # or "facts"
 DEF_LANG = "id"       # "id"/"en"
-DEF_DUR  = 60         # 20..90
 DEF_VAR  = 4          # 3..5
 
 # ====== Kanvas (ubah bila perlu) ======
@@ -99,7 +100,7 @@ def fetch_wikipedia_facts(lang="id", limit=3):
     return out
 
 # ---------- Gemini ----------
-def gemini_overlay_and_carousel(mode, lang, sources, dur, nvar):
+def gemini_overlay_and_carousel(mode, lang, sources, nvar):
     locale = "Bahasa Indonesia" if lang=="id" else "English"
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     src_text=[]
@@ -114,7 +115,7 @@ def gemini_overlay_and_carousel(mode, lang, sources, dur, nvar):
     src_blob="\n".join(src_text) if src_text else "(no sources)"
     prompt=f"""
 You are an assistant for short vertical videos. Today: {now_str}. Write in {locale}.
-TASK A: Overlay script for {dur}s vertical video → 3–6 short lines (~360 chars), factual, safe, no hashtags.
+TASK A: Overlay script for a vertical video (no hashtags) → 3–6 short lines (~360 chars), factual, safe.
 TASK B: {nvar} variants for Facebook → title (<=75 chars) + 20 hashtags (lowercase; if locale is Indonesian include 5 Indonesia-specific).
 Also output a short credits line (1–2 source domains).
 SOURCES:
@@ -197,15 +198,11 @@ def _text_image(text: str, box_w: int, box_h: int, fontsize: int, align: str="ce
 
 # ---------- FIT VIDEO KE KANVAS 9:16 ----------
 def fit_to_canvas(clip: VideoFileClip, canvas_w: int, canvas_h: int) -> CompositeVideoClip:
-    """
-    Letterbox 'contain':
-      - Buat canvas (hitam) ukuran (canvas_w x canvas_h)
-      - Resize video agar seluruhnya terlihat, center, tanpa crop
-    """
+    """Letterbox 'contain': seluruh video terlihat di kanvas 9:16."""
     vw, vh = clip.size
     scale = min(canvas_w / vw, canvas_h / vh)
     new_w, new_h = int(vw * scale), int(vh * scale)
-    resized = clip.resize((new_w, new_h))   # shim di atas menutup ANTIALIAS
+    resized = clip.resize((new_w, new_h))   # shim menutup ANTIALIAS
     x = (canvas_w - new_w) // 2
     y = (canvas_h - new_h) // 2
     canvas = ColorClip((canvas_w, canvas_h), color=(0,0,0)).set_duration(clip.duration)
@@ -215,15 +212,19 @@ def fit_to_canvas(clip: VideoFileClip, canvas_w: int, canvas_h: int) -> Composit
 def _tc_height_guess(panel_h:int)->int: return int(panel_h*0.1)
 
 def render_video_with_overlay(bg_path: str, overlay_lines: List[str],
-                              credits: str, out_path: str, target_duration: int = 60):
+                              credits: str, out_path: str) -> float:
     """
-    - Force canvas ke 9:16 (1080x1920) via letterbox
+    - Durasi output = durasi asli video background
+    - Force canvas 9:16
     - Panel + teks (Pillow → numpy → ImageClip)
-    - Encode streamable untuk Telegram
+    - Encode streamable & bawa audio asli
+    Returns: duration (seconds)
     """
-    clip = VideoFileClip(bg_path)
-    duration = min(float(clip.duration), float(target_duration))
-    base = clip.subclip(0, duration)
+    clip = VideoFileClip(bg_path, audio=True)
+    base = clip  # full duration, tidak dipotong
+    duration = float(base.duration)
+    fps = getattr(base, "fps", 30) or 30
+
     # Fit ke kanvas 9:16
     sub = fit_to_canvas(base, CANVAS_W, CANVAS_H)
     W, H = CANVAS_W, CANVAS_H
@@ -255,23 +256,28 @@ def render_video_with_overlay(bg_path: str, overlay_lines: List[str],
     cred_clip = (ImageClip(cred_np).set_duration(sub.duration)
                  .set_position((int(W*0.02), int(H*0.94) - cred_box_h)))
 
+    # Gabung + bawa AUDIO ASLI
     final = CompositeVideoClip([sub, panel, text_clip, cred_clip])
+    if sub.audio is not None:
+        final = final.set_audio(sub.audio)
+
     final.write_videofile(
         out_path,
         codec="libx264",
         audio_codec="aac",
         audio=True,
-        fps=30,
+        fps=int(round(fps)),
         threads=0,
         preset="medium",
         bitrate="3500k",
         ffmpeg_params=["-pix_fmt", "yuv420p", "-movflags", "+faststart"],
     )
+    return duration
 
-# ---------- UI / Buttons ----------
+# ---------- UI / Buttons (tanpa durasi) ----------
 def _init_defaults(chat_id:int):
     SESSION[chat_id] = SESSION.get(chat_id, {})
-    SESSION[chat_id].update({"mode": DEF_MODE, "lang": DEF_LANG, "dur": DEF_DUR, "variants": DEF_VAR})
+    SESSION[chat_id].update({"mode": DEF_MODE, "lang": DEF_LANG, "variants": DEF_VAR})
 
 def _label(cur, val, txt): return f"✅ {txt}" if cur == val else txt
 
@@ -279,26 +285,19 @@ def _build_menu(chat_id:int) -> Tuple[str, InlineKeyboardMarkup]:
     st = SESSION.get(chat_id, {})
     mode = st.get("mode", DEF_MODE)
     lang = st.get("lang", DEF_LANG)
-    dur = int(st.get("dur", DEF_DUR))
     var = int(st.get("variants", DEF_VAR))
-
     text = (f"🎛 **Pengaturan**\n"
             f"- Mode: `{mode}`\n"
             f"- Bahasa: `{lang}`\n"
-            f"- Durasi: `{dur}s`\n"
-            f"- Variants: `{var}`\n"
-            f"- Canvas: `{CANVAS_W}x{CANVAS_H}` (9:16)\n\n"
+            f"- Variants judul/hashtag: `{var}`\n"
+            f"- Canvas: `{CANVAS_W}x{CANVAS_H}` (9:16)\n"
+            f"- Durasi output: **mengikuti video background**\n\n"
             f"Tekan tombol untuk mengubah, lalu **Render ▶️**.")
-
     kb = [
         [InlineKeyboardButton(_label(mode,"news","📰 News"),  callback_data="set:mode:news"),
          InlineKeyboardButton(_label(mode,"facts","📘 Facts"), callback_data="set:mode:facts")],
         [InlineKeyboardButton(_label(lang,"id","🇮🇩 ID"),      callback_data="set:lang:id"),
          InlineKeyboardButton(_label(lang,"en","🇬🇧 EN"),      callback_data="set:lang:en")],
-        [InlineKeyboardButton(_label(dur,20,"20s"), callback_data="set:dur:20"),
-         InlineKeyboardButton(_label(dur,45,"45s"), callback_data="set:dur:45"),
-         InlineKeyboardButton(_label(dur,60,"60s"), callback_data="set:dur:60"),
-         InlineKeyboardButton(_label(dur,90,"90s"), callback_data="set:dur:90")],
         [InlineKeyboardButton(_label(var,3,"3 var"), callback_data="set:var:3"),
          InlineKeyboardButton(_label(var,4,"4 var"), callback_data="set:var:4"),
          InlineKeyboardButton(_label(var,5,"5 var"), callback_data="set:var:5")],
@@ -313,7 +312,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SESSION.pop(chat_id, None)  # reset
     await update.message.reply_text(
         "👋 Halo! Kirim video MP4 untuk dijadikan background.\n"
-        f"Bot akan auto-resize ke 9:16 ({CANVAS_W}x{CANVAS_H}).\n"
+        f"Bot akan auto-resize ke 9:16 ({CANVAS_W}x{CANVAS_H}) & durasi output mengikuti video background.\n"
         "Setelah terkirim, kamu akan dapat menu tombol."
     )
 
@@ -349,7 +348,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _, key, val = data
             if key == "mode": SESSION[chat_id]["mode"] = val
             elif key == "lang": SESSION[chat_id]["lang"] = val
-            elif key == "dur":  SESSION[chat_id]["dur"]  = max(20, min(90, int(val)))
             elif key == "var":  SESSION[chat_id]["variants"] = max(3, min(5, int(val)))
             text, kb = _build_menu(chat_id)
             if q.message.text != text:
@@ -374,13 +372,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "bg_path": st["video_path"],
                 "mode": st["mode"],
                 "lang": st["lang"],
-                "dur":  int(st["dur"]),
                 "variants": int(st["variants"]),
             }
             await JOB_QUEUE.put(job)
             await q.edit_message_text(
-                f"🧾 Job ditambahkan: {job['mode']}/{job['lang']}, dur={job['dur']}s, variants={job['variants']}\n"
-                f"Menunggu giliran di antrian..."
+                f"🧾 Job ditambahkan: {job['mode']}/{job['lang']}, variants={job['variants']}\n"
+                f"Durasi mengikuti video background. Menunggu giliran di antrian..."
             )
 
             global WORKER_STARTED
@@ -427,17 +424,17 @@ async def worker(app: Application):
                 continue
 
             # 2) Gemini
-            data = gemini_overlay_and_carousel(job["mode"], job["lang"], sources, job["dur"], job["variants"])
+            data = gemini_overlay_and_carousel(job["mode"], job["lang"], sources, job["variants"])
             overlay = [ln.strip() for ln in (data.get("overlay_script","").splitlines()) if ln.strip()]
             if len(overlay) < 3: overlay += [""]*(3-len(overlay))
             overlay = overlay[:6]
             credits = data.get("credits","")
             variants = data.get("variants",[])
 
-            # 3) Render
+            # 3) Render (durasi = durasi asli background)
             outdir = tempfile.mkdtemp(prefix="out_")
             out_video = os.path.join(outdir, f"short_{uuid.uuid4().hex}.mp4")
-            render_video_with_overlay(job["bg_path"], overlay, credits, out_video, job["dur"])
+            duration = render_video_with_overlay(job["bg_path"], overlay, credits, out_video)
 
             # 4) Caption variants file
             capfile = os.path.join(outdir, "caption_variants.txt")
@@ -450,13 +447,15 @@ async def worker(app: Application):
                     f.write(" ".join(hs) + "\n\n")
                 if credits: f.write(credits.strip() + "\n")
 
-            # 5) Kirim hasil
+            # 5) Kirim hasil (streamable)
             caption_title = (variants[0].get("title") if variants else "Konten Menarik")[:1000]
             await app.bot.send_video(
                 chat_id,
                 video=InputFile(out_video, filename="output.mp4"),
                 caption=caption_title,
-                supports_streaming=True,   # penting untuk playable
+                width=CANVAS_W, height=CANVAS_H,
+                duration=int(round(duration)),
+                supports_streaming=True,
             )
             await app.bot.send_document(
                 chat_id,
@@ -477,7 +476,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, save_video))
     app.add_handler(CallbackQueryHandler(on_button))
-    print(f"Bot running... (Gemini model: {GEMINI_MODEL}; canvas {CANVAS_W}x{CANVAS_H})")
+    print(f"Bot running... (Gemini model: {GEMINI_MODEL}; canvas {CANVAS_W}x{CANVAS_H}; durasi ikut background)")
     app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
