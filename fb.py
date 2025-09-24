@@ -6,6 +6,7 @@ Telegram bot: Viral News / Fakta Unik -> Video Overlay (Shorts) + FULL Button UI
 - Queue render + carousel judul/hashtag
 - Auto-resize ke kanvas vertikal 9:16 (default 1080x1920)
 - Kompatibel Pillow 10+ (shim Resampling untuk MoviePy)
+- Kirim video streamable (yuv420p + faststart)
 """
 
 import os, re, json, uuid, tempfile, asyncio, textwrap
@@ -29,15 +30,12 @@ from PIL import Image, ImageDraw, ImageFont
 try:
     from PIL import Image as _PILImage
     if not hasattr(Image, "ANTIALIAS"):
-        try:
-            from PIL.Image import Resampling
-            Image.ANTIALIAS = Resampling.LANCZOS
-            Image.LANCZOS   = Resampling.LANCZOS
-            Image.BICUBIC   = Resampling.BICUBIC
-            Image.BILINEAR  = Resampling.BILINEAR
-            Image.NEAREST   = Resampling.NEAREST
-        except Exception:
-            pass
+        from PIL.Image import Resampling
+        Image.ANTIALIAS = Resampling.LANCZOS
+        Image.LANCZOS   = Resampling.LANCZOS
+        Image.BICUBIC   = Resampling.BICUBIC
+        Image.BILINEAR  = Resampling.BILINEAR
+        Image.NEAREST   = Resampling.NEAREST
 except Exception:
     pass
 
@@ -207,7 +205,7 @@ def fit_to_canvas(clip: VideoFileClip, canvas_w: int, canvas_h: int) -> Composit
     vw, vh = clip.size
     scale = min(canvas_w / vw, canvas_h / vh)
     new_w, new_h = int(vw * scale), int(vh * scale)
-    resized = clip.resize((new_w, new_h))   # MoviePy pakai PIL → shim di atas menutup ANTIALIAS
+    resized = clip.resize((new_w, new_h))   # shim di atas menutup ANTIALIAS
     x = (canvas_w - new_w) // 2
     y = (canvas_h - new_h) // 2
     canvas = ColorClip((canvas_w, canvas_h), color=(0,0,0)).set_duration(clip.duration)
@@ -221,6 +219,7 @@ def render_video_with_overlay(bg_path: str, overlay_lines: List[str],
     """
     - Force canvas ke 9:16 (1080x1920) via letterbox
     - Panel + teks (Pillow → numpy → ImageClip)
+    - Encode streamable untuk Telegram
     """
     clip = VideoFileClip(bg_path)
     duration = min(float(clip.duration), float(target_duration))
@@ -257,8 +256,17 @@ def render_video_with_overlay(bg_path: str, overlay_lines: List[str],
                  .set_position((int(W*0.02), int(H*0.94) - cred_box_h)))
 
     final = CompositeVideoClip([sub, panel, text_clip, cred_clip])
-    final.write_videofile(out_path, codec="libx264", audio_codec="aac",
-                          fps=30, threads=0, preset="medium", bitrate="3500k")
+    final.write_videofile(
+        out_path,
+        codec="libx264",
+        audio_codec="aac",
+        audio=True,
+        fps=30,
+        threads=0,
+        preset="medium",
+        bitrate="3500k",
+        ffmpeg_params=["-pix_fmt", "yuv420p", "-movflags", "+faststart"],
+    )
 
 # ---------- UI / Buttons ----------
 def _init_defaults(chat_id:int):
@@ -444,8 +452,17 @@ async def worker(app: Application):
 
             # 5) Kirim hasil
             caption_title = (variants[0].get("title") if variants else "Konten Menarik")[:1000]
-            await app.bot.send_video(chat_id, video=InputFile(out_video), caption=caption_title)
-            await app.bot.send_document(chat_id, document=InputFile(capfile), caption="Judul & hashtag (3–5 variasi)")
+            await app.bot.send_video(
+                chat_id,
+                video=InputFile(out_video, filename="output.mp4"),
+                caption=caption_title,
+                supports_streaming=True,   # penting untuk playable
+            )
+            await app.bot.send_document(
+                chat_id,
+                document=InputFile(capfile, filename="caption_variants.txt"),
+                caption="Judul & hashtag (3–5 variasi)"
+            )
 
         except Exception as e:
             try:
