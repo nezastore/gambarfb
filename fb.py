@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 Telegram bot: Theme → AI Image + Facebook Caption (Title + Description + Hashtags)
-- Pilih tema & gaya → bot generate gambar via Gemini Image (fallback: ilustrasi abstrak)
+- Pilih tema & gaya → bot generate gambar via Gemini Image (prioritas: imagen-3.0-generate-001, fallback: gemini-2.0-flash IMAGE)
 - Gemini Text buat judul (<=75 chars), deskripsi singkat, dan 20 hashtag (FB-friendly)
 - Kirim ke Telegram sebagai FOTO + caption siap tempel
 - UI tombol: Tema, Gaya, Bahasa, Random, Generate, Reset
 
 Env:
-  TELEGRAM_BOT_TOKEN, GEMINI_API_KEY
+  TELEGRAM_BOT_TOKEN=xxxx:yyyy
+  GEMINI_API_KEY=your_key
 """
 
 import os, re, json, html, base64, tempfile, asyncio, uuid
@@ -25,15 +26,12 @@ if not GEMINI_API_KEY:
     print("⚠️ GEMINI_API_KEY kosong. Fitur AI bisa gagal.")
 
 import numpy as np
-from PIL import Image, ImageDraw
-import requests
+from PIL import Image, ImageDraw, ImageFilter
 
-# Telegram
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.error import BadRequest
 
-# Gemini
 import google.generativeai as genai
 genai.configure(api_key=GEMINI_API_KEY)
 
@@ -48,11 +46,10 @@ def pick_gemini_text_model() -> str:
 
 TEXT_MODEL = pick_gemini_text_model()
 
-# Kandidat model image (akan dicoba satu per satu)
+# Urutan model gambar yang dicoba (paling dipercaya dulu)
 IMAGE_MODELS = [
-    "gemini-2.5-flash-image-preview",  # image-gen preview (terbaru, region-dependent)
-    "imagen-3.0-generate-001",         # Imagen via Gemini API (nama bisa berbeda per akun/region)
-    "imagen-3.0",
+    "imagen-3.0-generate-001",     # prioritas 1
+    "gemini-2.0-flash",            # prioritas 2 (dengan response_modalities=["IMAGE"])
 ]
 
 # ====== STATE ======
@@ -80,9 +77,7 @@ def init_chat(cid: int):
     CONF[cid].setdefault("lang",  DEF_LANG)
 
 def label(cur, val, txt): return f"✅ {txt}" if cur == val else txt
-
-def esc(s: str) -> str:
-    return html.escape(s or "", quote=False)
+def esc(s: str) -> str: return html.escape(s or "", quote=False)
 
 def build_menu(cid: int) -> Tuple[str, InlineKeyboardMarkup]:
     st = CONF[cid]
@@ -93,11 +88,10 @@ def build_menu(cid: int) -> Tuple[str, InlineKeyboardMarkup]:
         f"- Tema: `{t}`\n"
         f"- Gaya: `{g}`\n"
         f"- Bahasa: `{l}`\n\n"
-        "Klik **Generate** untuk membuat *gambar + judul + deskripsi + hashtag* siap upload Facebook."
-        "\nJika model image tidak tersedia, bot membuat ilustrasi fallback (abstrak estetik)."
+        "Klik **Generate** untuk membuat *gambar + judul + deskripsi + hashtag* siap upload Facebook.\n"
+        "Bot akan mencoba model gambar: `imagen-3.0-generate-001` → `gemini-2.0-flash` → fallback ilustrasi."
     )
 
-    # Baris tema (2×5 tombol)
     theme_rows = []
     row = []
     for i, th in enumerate(THEMES, 1):
@@ -106,10 +100,8 @@ def build_menu(cid: int) -> Tuple[str, InlineKeyboardMarkup]:
             theme_rows.append(row); row = []
     if row: theme_rows.append(row)
 
-    style_row = [
-        InlineKeyboardButton(label(g, s, s), callback_data=f"set:style:{s}") for s in STYLES
-    ]
-    lang_row = [
+    style_row = [InlineKeyboardButton(label(g, s, s), callback_data=f"set:style:{s}") for s in STYLES]
+    lang_row  = [
         InlineKeyboardButton(label(l, "id", "🇮🇩 ID"), callback_data="set:lang:id"),
         InlineKeyboardButton(label(l, "en", "🇬🇧 EN"), callback_data="set:lang:en"),
     ]
@@ -126,7 +118,7 @@ def fb_caption_html(title: str, description: str, hashtags: List[str]) -> str:
     hs = [h if h.startswith("#") else f"#{h}" for h in hashtags]
     return f"<b>{esc(title)}</b>\n\n{esc(description)}\n\n" + " ".join(hs)
 
-# ====== GEMINI TEXT (title + description + hashtags) ======
+# ====== GEMINI TEXT ======
 def gemini_make_caption(theme: str, style: str, lang: str) -> Dict:
     locale = "Bahasa Indonesia" if lang == "id" else "English"
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -147,19 +139,17 @@ Return STRICT JSON with:
 }}
 Avoid clickbait and keep it brand-safe & factual.
 """
-
     try:
         model = genai.GenerativeModel(TEXT_MODEL)
         resp = model.generate_content(prompt)
         txt = (resp.text or "").strip()
         txt = re.sub(r"^```(?:json)?|```$", "", txt, flags=re.MULTILINE).strip()
         data = json.loads(txt)
-        # minimal guard
         if not isinstance(data.get("hashtags"), list):
-            data["hashtags"] = ["#inspirasi", "#viral", "#today", "#info", "#kreatif"] * 4
-        data["hashtags"] = data["hashtags"][:20]
+            data["hashtags"] = []
+        data["hashtags"] = (data["hashtags"] or [])[:20]
         data.setdefault("title", f"{theme} {style}")
-        data.setdefault("description", "Konten menarik bertema visual yang memanjakan mata.")
+        data.setdefault("description", "Visual estetik yang menenangkan, cocok untuk isi feed harianmu.")
         return data
     except Exception:
         return {
@@ -169,25 +159,23 @@ Avoid clickbait and keep it brand-safe & factual.
                 "#inspirasi", "#estetik", "#visual", "#kreatif", "#viralindonesia",
                 "#exploreindonesia", "#keindahan", "#senja", "#vibes", "#wallpaper",
                 "#fotografi", "#digitalart", "#art", "#desain", "#minimalis",
-                "#mood", "#relax", "#healing", "#trending", "#today"
+                "#mood", "#relax", "#healing", "#trending", "#today", "#indonesia"
             ]
         }
 
-# ====== GEMINI IMAGE (text-to-image) + FALLBACK ======
+# ====== GEMINI IMAGE ======
 def image_resp_to_bytes(resp) -> Optional[bytes]:
     try:
-        cands = getattr(resp, "candidates", None) or []
-        for c in cands:
+        # pola umum: resp.candidates[0].content.parts[*].inline_data
+        for c in getattr(resp, "candidates", []) or []:
             content = getattr(c, "content", None)
             if not content: continue
-            parts = getattr(content, "parts", []) or []
-            for p in parts:
+            for p in getattr(content, "parts", []) or []:
                 inline = getattr(p, "inline_data", None) or getattr(p, "inlineData", None)
                 if inline and getattr(inline, "data", None):
                     return base64.b64decode(inline.data)
         # fallback pola lain
-        parts = getattr(resp, "parts", []) or []
-        for p in parts:
+        for p in getattr(resp, "parts", []) or []:
             inline = getattr(p, "inline_data", None) or getattr(p, "inlineData", None)
             if inline and getattr(inline, "data", None):
                 return base64.b64decode(inline.data)
@@ -197,67 +185,98 @@ def image_resp_to_bytes(resp) -> Optional[bytes]:
 
 def build_image_prompt(theme: str, style: str, lang: str) -> str:
     locale = "Bahasa Indonesia" if lang == "id" else "English"
+    # prompt diperjelas & diarahkan untuk hasil yang enak (bukan bentuk abstrak sederhana)
     return f"""
-Create a beautiful social-media friendly image for:
+Generate a single high-quality social-media image for:
 Theme: {theme}
 Style: {style}
-Guidelines:
-- vertical-friendly cropping, center composition
-- clean background, no text, no watermark, brand-safe
-- high contrast, vibrant yet natural color
-- resolution 1024x1024
+
+Composition & quality:
+- vertical-friendly (9:16 crop safe), centered subject, depth & lighting
+- photogenic, natural but vibrant colors, cinematic contrast
+- realistic details if photorealistic; neat shapes if illustration
+- absolutely NO text, NO watermark, NO borders
+- resolution around 1024x1024
+
+Deliver exactly ONE image.
 Language context: {locale}.
 """
 
 def gemini_generate_image(theme: str, style: str, lang: str) -> Optional[str]:
     prompt = build_image_prompt(theme, style, lang)
-    for model_name in IMAGE_MODELS:
-        try:
-            model = genai.GenerativeModel(
-                model_name,
-                generation_config={"response_modalities": ["IMAGE"]},
-            )
-            resp = model.generate_content(prompt)
-            img = image_resp_to_bytes(resp)
-            if not img and getattr(resp, "text", None) and "data:image" in resp.text:
-                b64 = resp.text.split("base64,")[-1].split('"')[0].strip()
-                img = base64.b64decode(b64)
-            if img:
-                fd, path = tempfile.mkstemp(prefix="gemimg_", suffix=".png")
-                with os.fdopen(fd, "wb") as f:
-                    f.write(img)
-                return path
-        except Exception:
-            continue
+
+    # Prioritas 1: imagen-3.0-generate-001
+    try:
+        model = genai.GenerativeModel(
+            "imagen-3.0-generate-001",
+            generation_config={"response_modalities": ["IMAGE"]},
+        )
+        resp = model.generate_content(prompt)
+        img = image_resp_to_bytes(resp)
+        if img:
+            fd, path = tempfile.mkstemp(prefix="gemimg_", suffix=".png")
+            with os.fdopen(fd, "wb") as f:
+                f.write(img)
+            return path
+    except Exception as e:
+        print(f"[!] imagen-3.0-generate-001 gagal: {e}")
+
+    # Prioritas 2: gemini-2.0-flash (kapan-kapan bisa mengeluarkan IMAGE)
+    try:
+        model = genai.GenerativeModel(
+            "gemini-2.0-flash",
+            generation_config={"response_modalities": ["IMAGE"]},
+        )
+        resp = model.generate_content(prompt)
+        img = image_resp_to_bytes(resp)
+        if img:
+            fd, path = tempfile.mkstemp(prefix="gemimg_", suffix=".png")
+            with os.fdopen(fd, "wb") as f:
+                f.write(img)
+            return path
+    except Exception as e:
+        print(f"[!] gemini-2.0-flash(image) gagal: {e}")
+
     return None
 
+# ====== FALLBACK IMAGE (lebih estetik) ======
 def fallback_image(theme: str, style: str) -> str:
-    """Ilustrasi abstrak estetik bila image model tidak tersedia."""
-    W, H = 1024, 1024
-    img = Image.new("RGB", (W, H), (10, 10, 14))
-    dr = ImageDraw.Draw(img)
+    """Ilustrasi abstrak soft gradient + bokeh supaya lebih estetik."""
+    W, H = 1080, 1920  # portrait-friendly
+    base = Image.new("RGB", (W, H), (12, 14, 22))
 
-    # gradient diagonal
-    grad = Image.new("RGB", (W, H))
+    # soft vertical gradient
+    top = np.array([30, 40, 75])
+    bottom = np.array([120, 60, 140])
+    grad = np.zeros((H, W, 3), dtype=np.uint8)
     for y in range(H):
-        r = int(40 + 60 * (y / H))
-        g = int(50 + 80 * (1 - y / H))
-        b = int(120 + 100 * (y / H))
-        dr.line([(0, y), (W, y)], fill=(r, g, b))
-    # overlay bentuk bulat lembut
+        t = y / (H - 1)
+        color = (1 - t) * top + t * bottom
+        grad[y, :, :] = color
+    grad_img = Image.fromarray(grad, "RGB")
+
+    # overlay bokeh circles lembut
     rng = np.random.default_rng()
+    bokeh = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(bokeh)
     for _ in range(24):
-        x, y = rng.integers(0, W), rng.integers(0, H)
-        rad = int(rng.integers(60, 180))
-        color = (int(rng.integers(80, 200)), int(rng.integers(60, 180)), int(rng.integers(120, 240)))
-        ImageDraw.Draw(img).ellipse([(x-rad, y-rad), (x+rad, y+rad)], fill=color+(90,))
+        r = int(rng.integers(80, 220))
+        x = int(rng.integers(-r, W + r))
+        y = int(rng.integers(-r, H + r))
+        col = (int(rng.integers(100, 200)), int(rng.integers(80, 190)), int(rng.integers(140, 240)), int(rng.integers(40, 90)))
+        draw.ellipse([(x - r, y - r), (x + r, y + r)], fill=col)
+    bokeh = bokeh.filter(ImageFilter.GaussianBlur(12))
 
-    # blend
-    img = Image.blend(img, grad, 0.35)
+    final = Image.alpha_composite(grad_img.convert("RGBA"), bokeh).convert("RGB")
+    # vignette halus
+    vign = Image.new("L", (W, H), 0)
+    dv = ImageDraw.Draw(vign)
+    dv.ellipse([(-int(W*0.15), -int(H*0.05)), (int(W*1.15), int(H*1.05))], fill=255)
+    vign = vign.filter(ImageFilter.GaussianBlur(150))
+    final = Image.composite(final, Image.new("RGB", (W, H), (8, 8, 12)), vign)
 
-    # simpan
     fp = os.path.join(tempfile.gettempdir(), f"fallback_{uuid.uuid4().hex}.jpg")
-    img.save(fp, "JPEG", quality=92)
+    final.save(fp, "JPEG", quality=92)
     return fp
 
 # ====== TELEGRAM UI ======
@@ -268,7 +287,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Selamat datang!\n"
         "Pilih *Tema*, *Gaya*, dan *Bahasa*, lalu klik **Generate**.\n"
         "Bot akan membuat **gambar + judul + deskripsi + hashtag** siap upload Facebook.\n"
-        "Jika image model tidak tersedia, bot membuat ilustrasi fallback (abstrak estetik).",
+        "Urutan model gambar: imagen-3.0-generate-001 → gemini-2.0-flash → ilustrasi fallback.",
         disable_web_page_preview=True
     )
     text, kb = build_menu(cid)
@@ -324,18 +343,20 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cap = gemini_make_caption(theme, style, lang)
         caption_html = fb_caption_html(cap["title"], cap["description"], cap["hashtags"])
 
-        # 2) Image
-        path = gemini_generate_image(theme, style, lang)
-        if not path:
-            path = fallback_image(theme, style)
+        # 2) Image via Gemini (prioritas) → fallback jika gagal
+        img_path = gemini_generate_image(theme, style, lang)
+        used = "Gemini Image"
+        if not img_path:
+            img_path = fallback_image(theme, style)
+            used = "Fallback"
 
         # 3) Kirim
         try:
-            with open(path, "rb") as f:
+            with open(img_path, "rb") as f:
                 await context.bot.send_photo(
                     cid,
                     photo=InputFile(f, filename="image.jpg"),
-                    caption=caption_html,
+                    caption=caption_html + f"\n\n<i>Image source: {used}</i>",
                     parse_mode="HTML",
                 )
         except Exception as e:
@@ -358,8 +379,9 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_cb))
-    print(f"Bot ready. Text model: {TEXT_MODEL}; Image fallbacks: {', '.join(IMAGE_MODELS)}")
+    print(f"Bot ready. Text model: {TEXT_MODEL}; Image order: {', '.join(IMAGE_MODELS)}")
     app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
+v
