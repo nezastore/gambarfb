@@ -1,124 +1,355 @@
-import os
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Telegram bot: Viral News / Fakta Unik -> Video Overlay (Shorts)
+Fitur:
+- /start  : Petunjuk
+- Kirim video: disimpan sebagai background terakhir untuk chat (per chat)
+- /make   : Enqueue job -> bot proses berurutan (queue render)
+  Argumen: mode=[news|facts] lang=[id|en] dur=[20..90] variants=[3..5]
+Output:
+- MP4 (overlay teks)
+- caption_variants.txt (3–5 opsi judul + hashtag FB)
+Deps:
+- python-telegram-bot==21.6, moviepy==1.0.3, feedparser==6.0.11
+- requests==2.32.3, pillow==10.4.0, google-generativeai==0.8.3
+- python-dotenv==1.0.1
+OS:
+- ffmpeg wajib terpasang (apt install ffmpeg)
+"""
+
+import os, io, re, json, uuid, tempfile, asyncio
+from datetime import datetime, timezone
+from typing import List, Dict
+
+from dotenv import load_dotenv
+load_dotenv()  # baca .env di folder kerja
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
+
+import feedparser
 import requests
+from moviepy.editor import VideoFileClip, TextClip, CompositeVideoClip, ColorClip
+from telegram import Update, InputFile
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+
 import google.generativeai as genai
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from moviepy.editor import *
+genai.configure(api_key=GEMINI_API_KEY)
+GEMINI_MODEL = "gemini-2.0-flash"  # fallback otomatis bila tidak tersedia
 
-# --- KONFIGURASI ---
-TELEGRAM_BOT_TOKEN = "8326980628:AAFaamFAEozoEHEyX57lluFzHOsyMspDaJo"
-GOOGLE_AI_API_KEY = "AIzaSyC-gwRbQc4ugBP532oVavmjtsBeOWgieCc"
-# -----------------
+# ====== State sederhana ======
+SESSION = {}   # {chat_id: {"video_path": str}}
+JOB_QUEUE: "asyncio.Queue[dict]" = asyncio.Queue()
+WORKER_STARTED = False
 
-# Konfigurasi Google AI
-genai.configure(api_key=GOOGLE_AI_API_KEY)
+WELCOME = (
+    "Halo! Kirim **video background** (MP4). Lalu pakai /make untuk membuat konten.\n\n"
+    "Contoh:\n"
+    "`/make mode=news lang=id dur=60 variants=4`\n"
+    "`/make mode=facts lang=en dur=45 variants=3`\n\n"
+    "• Sumber: Google News RSS (news) / Wikipedia (facts)\n"
+    "• Hasil: 1 video + file *caption_variants.txt* berisi 3–5 pilihan judul & hashtag FB.\n"
+    "• Bot memakai antrian, memproses 1 per 1 agar stabil di VPS.\n"
+)
 
-# Fungsi-fungsi dari skrip sebelumnya (sedikit dimodifikasi)
-def get_unique_fact():
+# ---------- Helpers: sumber ----------
+def fetch_google_news(topic: str, lang: str = "id", region: str = "ID", limit: int = 5):
+    q = requests.utils.quote(topic)
+    url = f"https://news.google.com/rss/search?q={q}&hl={lang}&gl={region}&ceid={region}:{lang}"
+    feed = feedparser.parse(url)
+    items = []
+    for entry in feed.entries[:limit]:
+        items.append({
+            "title": entry.title,
+            "url": entry.link,
+            "published": getattr(entry, "published", "")
+        })
+    return items
+
+def fetch_wikipedia_facts(lang: str = "id", limit: int = 3):
+    base = f"https://{lang}.wikipedia.org/api/rest_v1/page/random/summary"
+    results = []
+    for _ in range(limit):
+        try:
+            r = requests.get(base, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                title = data.get("title", "")
+                extract = data.get("extract", "")
+                url = data.get("content_urls", {}).get("desktop", {}).get("page", "")
+                if title and extract and url:
+                    results.append({"title": title, "summary": extract, "url": url})
+        except Exception:
+            pass
+    return results
+
+# ---------- Gemini ----------
+def gemini_overlay_and_carousel(mode: str, lang: str, sources: List[Dict],
+                                target_duration: int, n_variants: int):
+    locale = "Bahasa Indonesia" if lang == "id" else "English"
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    # Susun sumber
+    src_text = []
+    if mode == "news":
+        for i, s in enumerate(sources, 1):
+            src_text.append(f"{i}. {s.get('title')}\n   {s.get('url')}\n   published: {s.get('published','')}")
+    else:
+        for i, s in enumerate(sources, 1):
+            snippet = (s.get("summary") or "")
+            if len(snippet) > 300: snippet = snippet[:300] + "..."
+            src_text.append(f"{i}. {s.get('title')}\n   {s.get('url')}\n   note: {snippet}")
+    src_blob = "\n".join(src_text) if src_text else "(no sources)"
+
+    prompt = f"""
+You are an assistant for short vertical videos. Today: {now_str}.
+Write in {locale}.
+
+TASK A: Create a concise on-screen overlay script for a {target_duration}s vertical video:
+- 3–6 short lines, ~360 characters total; factual, safe, non-clickbait.
+- Synthesize multiple sources; avoid contradictions.
+- End with no hashtags.
+
+TASK B: Create {n_variants} distinct Facebook metadata variants:
+- Each variant: a title (<=75 chars) + 20 hashtags (lowercase, no spaces; include 5 Indonesia-specific if locale is Indonesian).
+- Keep variants diverse (wording & angle).
+
+Also produce a super-short credits line with 1–2 source domains (e.g., "Sumber: bbc.com, kompas.com").
+
+SOURCES:
+{src_blob}
+
+Return strictly this JSON:
+{{
+  "overlay_script": "Line1\\nLine2\\nLine3...",
+  "credits": "Sumber: ...",
+  "variants": [
+    {{"title": "...", "hashtags": ["#...", "#...", "..."]}},
+    ...
+  ]
+}}
+"""
+    model = genai.GenerativeModel(GEMINI_MODEL)
+    resp = model.generate_content(prompt)
+    text = (resp.text or "").strip()
+    text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
+
     try:
-        response = requests.get("https://uselessfacts.jsph.pl/random.json?language=en")
-        response.raise_for_status()
-        return response.json()['text']
-    except requests.exceptions.RequestException:
-        return "Fakta unik tidak ditemukan saat ini."
-
-def generate_title_and_hashtags(fact):
-    try:
-        model = genai.GenerativeModel('gemini-pro')
-        prompt = f"""
-        Buatkan saya judul yang menarik dan 3 hashtag yang relevan untuk video Facebook Pro (FB Pro).
-        Fakta unik di video: "{fact}"
-        Format:
-        Judul: [Judul di sini]
-        Hashtag: [Hashtag di sini]
-        """
-        response = model.generate_content(prompt)
-        return response.text
+        data = json.loads(text)
+        # minimal guards
+        if "variants" not in data or not isinstance(data["variants"], list):
+            data["variants"] = []
+        data["variants"] = data["variants"][:max(1, n_variants)]
+        return data
     except Exception:
-        return "Judul: Gagal Membuat Judul\nHashtag: #error"
+        return {
+            "overlay_script": "Info menarik hari ini.",
+            "credits": "",
+            "variants": [
+                {"title": "Fakta Menarik Hari Ini", "hashtags": ["#info", "#viral"]},
+                {"title": "Berita Viral Singkat", "hashtags": ["#berita", "#shorts"]},
+            ][:n_variants]
+        }
 
-def create_video(video_path, fact_text):
-    try:
-        video_clip = VideoFileClip(video_path)
-        duration = min(video_clip.duration, 10.0)
-        video_clip = video_clip.subclip(0, duration)
-        
-        w, h = video_clip.size
-        
-        text_clip = TextClip(fact_text, fontsize=45, color='white', font='Arial-Bold',
-                             method='caption', size=(w*0.9, None), bg_color='black')
-        
-        text_bg = ColorClip(size=(int(w*0.95), int(text_clip.h + 20)), color=(0,0,0)).set_opacity(0.6)
-        final_text = CompositeVideoClip([text_bg, text_clip.set_position("center")]).set_position("center").set_duration(duration)
-        
-        final_video = CompositeVideoClip([video_clip, final_text])
-        
-        output_filename = "hasil_video.mp4"
-        final_video.write_videofile(output_filename, codec='libx24', audio_codec='aac')
-        
-        video_clip.close() # Penting untuk menutup file
-        return output_filename
-    except Exception as e:
-        print(f"Error creating video: {e}")
-        return None
+# ---------- Render ----------
+def tc_height_guess(panel_h:int)->int:
+    return int(panel_h * 0.1)
 
-# Fungsi untuk handler bot
+def render_video_with_overlay(bg_path: str, overlay_lines: List[str],
+                              credits: str, out_path: str, target_duration: int = 60):
+    clip = VideoFileClip(bg_path)
+    duration = min(clip.duration, float(target_duration))
+    sub = clip.subclip(0, duration)
+    W, H = sub.size
+
+    panel_h = int(H * 0.32)
+    panel_y = int(H * 0.6)
+
+    panel = ColorClip(size=(W, panel_h), color=(0, 0, 0)).set_opacity(0.35)\
+            .set_duration(sub.duration).set_position(("center", panel_y - panel_h // 2))
+
+    joined = "\n".join(overlay_lines)
+    fontsize = max(28, int(H * 0.04))
+    txt = TextClip(
+        txt=joined,
+        fontsize=fontsize,
+        color="white",
+        font="DejaVu-Sans",
+        stroke_color="black",
+        stroke_width=max(1, fontsize // 14),
+        method="caption",
+        size=(int(W*0.88), None),
+        align="center"
+    ).set_duration(sub.duration).set_position(("center", panel_y - tc_height_guess(panel_h)))
+
+    credit_font = max(20, int(H*0.025))
+    credits_clip = TextClip(
+        txt=credits,
+        fontsize=credit_font,
+        color="white",
+        font="DejaVu-Sans",
+        stroke_color="black",
+        stroke_width=max(1, credit_font // 10),
+        method="label",
+    ).set_duration(sub.duration).set_position((int(W*0.02), int(H*0.94)))
+
+    final = CompositeVideoClip([sub, panel, txt, credits_clip])
+    final.write_videofile(out_path, codec="libx264", audio_codec="aac",
+                          fps=30, threads=0, preset="medium", bitrate="3500k")
+
+# ---------- Telegram handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler untuk perintah /start"""
+    await update.message.reply_text(WELCOME, parse_mode="Markdown")
+
+async def save_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    vid = update.message.video or update.message.document
+    if not vid:
+        await update.message.reply_text("Kirim file video MP4 ya.")
+        return
+    os.makedirs("data", exist_ok=True)
+    f = await context.bot.get_file(vid.file_id)
+    local = os.path.join("data", f"{chat_id}_{uuid.uuid4().hex}.mp4")
+    await f.download_to_drive(local)
+
+    SESSION.setdefault(chat_id, {})["video_path"] = local
+    await update.message.reply_text("✅ Video disimpan. Jalankan `/make mode=news lang=id dur=60 variants=4`")
+
+def parse_args(arglist: List[str])->Dict[str,str]:
+    args = {"mode":"news","lang":"id","dur":"60","variants":"4"}
+    text = " ".join(arglist or [])
+    for part in text.split():
+        if "=" in part:
+            k,v = part.split("=",1)
+            args[k.lower().strip()] = v.strip()
+    return args
+
+async def make_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global WORKER_STARTED
+    chat_id = update.effective_chat.id
+    args = parse_args(context.args)
+
+    mode = args.get("mode","news")
+    lang = args.get("lang","id")
+    dur = max(20, min(90, int(args.get("dur","60"))))
+    variants = int(args.get("variants","4"))
+    variants = max(3, min(5, variants))
+
+    sess = SESSION.get(chat_id, {})
+    bg_path = sess.get("video_path")
+    if not bg_path or not os.path.exists(bg_path):
+        await update.message.reply_text("Belum ada video. Kirim video MP4 dulu.")
+        return
+
+    job = {
+        "chat_id": chat_id,
+        "bg_path": bg_path,
+        "mode": mode,
+        "lang": lang,
+        "dur": dur,
+        "variants": variants,
+    }
+    await JOB_QUEUE.put(job)
+    pos = JOB_QUEUE.qsize()  # posisi job baru di ekor
     await update.message.reply_text(
-        "Halo! Kirimkan saya sebuah video (kurang dari 20MB) "
-        "dan saya akan mengubahnya menjadi video fakta unik untuk Anda."
+        f"🧾 Job ditambahkan ke antrian.\n"
+        f"Mode: {mode}, Lang: {lang}, Dur: {dur}s, Variants: {variants}\n"
+        f"Posisi dalam antrian: {pos}"
     )
 
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler untuk pesan video"""
-    message = update.message
-    await message.reply_text("Video diterima. Mohon tunggu, sedang memproses... ⏳")
+    # start worker sekali
+    if not WORKER_STARTED:
+        WORKER_STARTED = True
+        asyncio.create_task(worker(context.application))
 
-    try:
-        video_file = await message.video.get_file()
-        input_path = "input_video.mp4"
-        await video_file.download_to_drive(input_path)
-        
-        # 1. Dapatkan fakta
-        fact = get_unique_fact()
-        await message.reply_text(f"Fakta ditemukan: \"{fact}\"")
-        
-        # 2. Buat video
-        await message.reply_text("Membuat video baru...")
-        output_path = create_video(input_path, fact)
-        
-        if output_path and os.path.exists(output_path):
-            # 3. Kirim video hasil
-            await message.reply_text("Video selesai! Mengirimkan hasil...")
-            with open(output_path, 'rb') as video:
-                await context.bot.send_video(chat_id=message.chat_id, video=video)
-            
-            # 4. Buat dan kirim judul & hashtag
-            ai_content = generate_title_and_hashtags(fact)
-            await message.reply_text(f"Berikut rekomendasi judul dan hashtag untuk Anda:\n\n{ai_content}")
-            
-            # 5. Hapus file sementara
-            os.remove(input_path)
-            os.remove(output_path)
-        else:
-            await message.reply_text("Maaf, terjadi kesalahan saat membuat video. 😔")
+async def worker(app: Application):
+    while True:
+        job = await JOB_QUEUE.get()
+        chat_id = job["chat_id"]
+        try:
+            await app.bot.send_message(chat_id, "⏳ Memproses job kamu (ambil sumber → Gemini → render)...")
 
-    except Exception as e:
-        print(f"Error handle_video: {e}")
-        await message.reply_text("Oops, terjadi error. Silakan coba lagi.")
+            # 1) sumber
+            if job["mode"] == "news":
+                topics = ["trending", "viral", "breaking", "unik", "teknologi", "hiburan"]
+                news = []
+                for t in topics:
+                    try:
+                        part = fetch_google_news(
+                            t,
+                            lang="id" if job["lang"]=="id" else "en",
+                            region="ID" if job["lang"]=="id" else "US",
+                            limit=2
+                        )
+                        news.extend(part)
+                    except Exception:
+                        pass
+                uniq = []
+                seen = set()
+                for n in news:
+                    u = n.get("url")
+                    if u and u not in seen:
+                        seen.add(u)
+                        uniq.append(n)
+                sources = uniq[:5] if uniq else []
+            else:
+                sources = fetch_wikipedia_facts(lang="id" if job["lang"]=="id" else "en", limit=3)
 
+            if not sources:
+                await app.bot.send_message(chat_id, "❗Gagal mengambil sumber. Coba lagi nanti.")
+                continue
+
+            # 2) Gemini: overlay + carousel meta
+            data = gemini_overlay_and_carousel(
+                job["mode"], job["lang"], sources, job["dur"], job["variants"]
+            )
+            overlay_lines = [ln.strip() for ln in (data.get("overlay_script","").splitlines()) if ln.strip()]
+            if len(overlay_lines) < 3:
+                overlay_lines += [""] * (3 - len(overlay_lines))
+            overlay_lines = overlay_lines[:6]
+            credits = data.get("credits","")
+            variants = data.get("variants",[])
+
+            # 3) Render
+            outdir = tempfile.mkdtemp(prefix="out_")
+            out_video = os.path.join(outdir, f"short_{uuid.uuid4().hex}.mp4")
+            render_video_with_overlay(job["bg_path"], overlay_lines, credits, out_video, job["dur"])
+
+            # 4) Buat file carousel judul/hashtag
+            variants_txt = os.path.join(outdir, "caption_variants.txt")
+            with open(variants_txt, "w", encoding="utf-8") as f:
+                for i, v in enumerate(variants, 1):
+                    t = v.get("title","").strip()
+                    hs = v.get("hashtags",[])
+                    hs = [h if h.startswith("#") else "#"+h for h in hs]
+                    f.write(f"[{i}] {t}\n")
+                    f.write(" ".join(hs) + "\n\n")
+                if credits:
+                    f.write(credits.strip() + "\n")
+
+            # 5) Kirim hasil
+            await app.bot.send_video(chat_id, video=InputFile(out_video), caption=variants[0].get("title","Konten Menarik")[:1000])
+            await app.bot.send_document(chat_id, document=InputFile(variants_txt), caption="3–5 opsi judul & hashtag FB")
+
+        except Exception as e:
+            try:
+                await app.bot.send_message(chat_id, f"❌ Job gagal: {e}")
+            except:
+                pass
+        finally:
+            JOB_QUEUE.task_done()
+
+# ---------- Main ----------
 def main():
-    """Fungsi utama untuk menjalankan bot."""
-    print("Bot dimulai...")
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    # Daftarkan handler
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.VIDEO, handle_video))
-
-    # Mulai bot
-    application.run_polling()
+    if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
+        print(">>> Isi TELEGRAM_BOT_TOKEN dan GEMINI_API_KEY di .env")
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("make", make_cmd))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, save_video))
+    print("Bot running with queue + carousel...")
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
