@@ -5,6 +5,7 @@ Telegram bot: Viral News / Fakta Unik -> Video Overlay (Shorts) + FULL Button UI
 - Tanpa ImageMagick (render teks via Pillow → ImageClip)
 - Queue render + carousel judul/hashtag
 - Auto-resize ke kanvas vertikal 9:16 (default 1080x1920)
+- Kompatibel Pillow 10+ (shim Resampling untuk MoviePy)
 """
 
 import os, re, json, uuid, tempfile, asyncio, textwrap
@@ -24,6 +25,22 @@ if not GEMINI_API_KEY:
 # ====== Imports lib ======
 import feedparser, requests, numpy as np
 from PIL import Image, ImageDraw, ImageFont
+# ---- Pillow 10+ compatibility shim for MoviePy (ANTIALIAS removed)
+try:
+    from PIL import Image as _PILImage
+    if not hasattr(Image, "ANTIALIAS"):
+        try:
+            from PIL.Image import Resampling
+            Image.ANTIALIAS = Resampling.LANCZOS
+            Image.LANCZOS   = Resampling.LANCZOS
+            Image.BICUBIC   = Resampling.BICUBIC
+            Image.BILINEAR  = Resampling.BILINEAR
+            Image.NEAREST   = Resampling.NEAREST
+        except Exception:
+            pass
+except Exception:
+    pass
+
 from moviepy.editor import (
     VideoFileClip, CompositeVideoClip, ColorClip, ImageClip
 )
@@ -46,8 +63,7 @@ def pick_gemini_model() -> str:
 GEMINI_MODEL = pick_gemini_model()
 
 # ====== State ======
-# per chat: video_path, mode, lang, dur, variants
-SESSION: Dict[int, Dict[str, str]] = {}
+SESSION: Dict[int, Dict[str, str]] = {}   # per chat: video_path, mode, lang, dur, variants
 JOB_QUEUE: "asyncio.Queue[dict]" = asyncio.Queue()
 WORKER_STARTED = False
 
@@ -57,9 +73,10 @@ DEF_LANG = "id"       # "id"/"en"
 DEF_DUR  = 60         # 20..90
 DEF_VAR  = 4          # 3..5
 
-# ====== Kanvas (ubah ke 720x1280 jika mau) ======
+# ====== Kanvas (ubah bila perlu) ======
 CANVAS_W = 1080
 CANVAS_H = 1920
+# (opsi lain) 720x1280 → set CANVAS_W=720, CANVAS_H=1280
 
 # ---------- Sumber ----------
 def fetch_google_news(topic: str, lang="id", region="ID", limit=5):
@@ -125,7 +142,7 @@ Return strict JSON:
         return {"overlay_script":"Info menarik hari ini.","credits":"",
                 "variants":[{"title":"Konten Menarik","hashtags":["#info","#viral"]}]}
 
-# ---------- UTIL TEKS PIL (tanpa ImageMagick) ----------
+# ---------- UTIL TEKS PIL ----------
 def _find_font_path() -> str:
     for p in [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -190,7 +207,7 @@ def fit_to_canvas(clip: VideoFileClip, canvas_w: int, canvas_h: int) -> Composit
     vw, vh = clip.size
     scale = min(canvas_w / vw, canvas_h / vh)
     new_w, new_h = int(vw * scale), int(vh * scale)
-    resized = clip.resize((new_w, new_h))
+    resized = clip.resize((new_w, new_h))   # MoviePy pakai PIL → shim di atas menutup ANTIALIAS
     x = (canvas_w - new_w) // 2
     y = (canvas_h - new_h) // 2
     canvas = ColorClip((canvas_w, canvas_h), color=(0,0,0)).set_duration(clip.duration)
@@ -210,7 +227,6 @@ def render_video_with_overlay(bg_path: str, overlay_lines: List[str],
     base = clip.subclip(0, duration)
     # Fit ke kanvas 9:16
     sub = fit_to_canvas(base, CANVAS_W, CANVAS_H)
-
     W, H = CANVAS_W, CANVAS_H
 
     # Panel gelap
@@ -225,12 +241,10 @@ def render_video_with_overlay(bg_path: str, overlay_lines: List[str],
     fontsize = max(28, int(H * 0.04))
     text_box_w = int(W * 0.88)
     text_box_h = panel_h - int(panel_h*0.2)
-
     text_img = _text_image(joined, text_box_w, text_box_h, fontsize, align="center",
                            stroke_w=max(1, fontsize//14))
-    text_np = np.array(text_img)  # <-- FIX: konversi ke numpy array
-    text_clip = (ImageClip(text_np)
-                 .set_duration(sub.duration)
+    text_np = np.array(text_img)
+    text_clip = (ImageClip(text_np).set_duration(sub.duration)
                  .set_position(("center", panel_y - _tc_height_guess(panel_h))))
 
     # Credits kecil kiri bawah
@@ -238,9 +252,8 @@ def render_video_with_overlay(bg_path: str, overlay_lines: List[str],
     cred_box_w, cred_box_h = int(W * 0.5), int(H * 0.06)
     cred_img = _text_image(credits, cred_box_w, cred_box_h, credit_font, align="left",
                            stroke_w=max(1, credit_font//10))
-    cred_np = np.array(cred_img)  # <-- FIX: konversi ke numpy array
-    cred_clip = (ImageClip(cred_np)
-                 .set_duration(sub.duration)
+    cred_np = np.array(cred_img)
+    cred_clip = (ImageClip(cred_np).set_duration(sub.duration)
                  .set_position((int(W*0.02), int(H*0.94) - cred_box_h)))
 
     final = CompositeVideoClip([sub, panel, text_clip, cred_clip])
@@ -252,8 +265,7 @@ def _init_defaults(chat_id:int):
     SESSION[chat_id] = SESSION.get(chat_id, {})
     SESSION[chat_id].update({"mode": DEF_MODE, "lang": DEF_LANG, "dur": DEF_DUR, "variants": DEF_VAR})
 
-def _label(cur, val, txt):
-    return f"✅ {txt}" if cur == val else txt
+def _label(cur, val, txt): return f"✅ {txt}" if cur == val else txt
 
 def _build_menu(chat_id:int) -> Tuple[str, InlineKeyboardMarkup]:
     st = SESSION.get(chat_id, {})
@@ -332,7 +344,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif key == "dur":  SESSION[chat_id]["dur"]  = max(20, min(90, int(val)))
             elif key == "var":  SESSION[chat_id]["variants"] = max(3, min(5, int(val)))
             text, kb = _build_menu(chat_id)
-            # Hindari error "message is not modified"
             if q.message.text != text:
                 await q.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
             else:
