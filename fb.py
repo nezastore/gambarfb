@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Telegram bot: Theme → AI Image + Facebook Caption (Title + Description + Hashtags)
-- Pilih tema & gaya → bot generate gambar via Gemini Image (prioritas: imagen-3.0-generate-001, fallback: gemini-2.0-flash IMAGE)
+- Pilih tema & gaya → bot generate gambar via Gemini Image (best-effort)
 - Gemini Text buat judul (<=75 chars), deskripsi singkat, dan 20 hashtag (FB-friendly)
 - Kirim ke Telegram sebagai FOTO + caption siap tempel
 - UI tombol: Tema, Gaya, Bahasa, Random, Generate, Reset
@@ -46,10 +46,10 @@ def pick_gemini_text_model() -> str:
 
 TEXT_MODEL = pick_gemini_text_model()
 
-# Urutan model gambar yang dicoba (paling dipercaya dulu)
+# Urutan model gambar yang dicoba (tanpa response_modalities supaya kompatibel)
 IMAGE_MODELS = [
-    "imagen-3.0-generate-001",     # prioritas 1
-    "gemini-2.0-flash",            # prioritas 2 (dengan response_modalities=["IMAGE"])
+    "imagen-3.0-generate-001",   # prioritas 1 (jika available di akun/region)
+    "gemini-2.0-flash",          # prioritas 2 (kadang bisa mengembalikan image)
 ]
 
 # ====== STATE ======
@@ -89,7 +89,7 @@ def build_menu(cid: int) -> Tuple[str, InlineKeyboardMarkup]:
         f"- Gaya: `{g}`\n"
         f"- Bahasa: `{l}`\n\n"
         "Klik **Generate** untuk membuat *gambar + judul + deskripsi + hashtag* siap upload Facebook.\n"
-        "Bot akan mencoba model gambar: `imagen-3.0-generate-001` → `gemini-2.0-flash` → fallback ilustrasi."
+        "Urutan model gambar: imagen-3.0-generate-001 → gemini-2.0-flash → ilustrasi fallback."
     )
 
     theme_rows = []
@@ -166,7 +166,7 @@ Avoid clickbait and keep it brand-safe & factual.
 # ====== GEMINI IMAGE ======
 def image_resp_to_bytes(resp) -> Optional[bytes]:
     try:
-        # pola umum: resp.candidates[0].content.parts[*].inline_data
+        # pola umum: resp.candidates[*].content.parts[*].inline_data
         for c in getattr(resp, "candidates", []) or []:
             content = getattr(c, "content", None)
             if not content: continue
@@ -185,98 +185,83 @@ def image_resp_to_bytes(resp) -> Optional[bytes]:
 
 def build_image_prompt(theme: str, style: str, lang: str) -> str:
     locale = "Bahasa Indonesia" if lang == "id" else "English"
-    # prompt diperjelas & diarahkan untuk hasil yang enak (bukan bentuk abstrak sederhana)
     return f"""
 Generate a single high-quality social-media image for:
 Theme: {theme}
 Style: {style}
 
 Composition & quality:
-- vertical-friendly (9:16 crop safe), centered subject, depth & lighting
-- photogenic, natural but vibrant colors, cinematic contrast
+- vertical-friendly (9:16 crop safe), centered subject, depth & cinematic lighting
+- photogenic, vibrant yet natural colors, pleasing contrast
 - realistic details if photorealistic; neat shapes if illustration
-- absolutely NO text, NO watermark, NO borders
-- resolution around 1024x1024
+- NO text, NO watermark, NO borders
+- resolution ~1024x1024
 
-Deliver exactly ONE image.
 Language context: {locale}.
+Deliver exactly ONE image.
 """
 
 def gemini_generate_image(theme: str, style: str, lang: str) -> Optional[str]:
+    """
+    Best-effort image generation:
+    1) imagen-3.0-generate-001 -> generate_content(prompt)
+    2) gemini-2.0-flash        -> generate_content(prompt)
+    Return file path if any, else None (caller will fallback).
+    """
     prompt = build_image_prompt(theme, style, lang)
 
-    # Prioritas 1: imagen-3.0-generate-001
-    try:
-        model = genai.GenerativeModel(
-            "imagen-3.0-generate-001",
-            generation_config={"response_modalities": ["IMAGE"]},
-        )
-        resp = model.generate_content(prompt)
-        img = image_resp_to_bytes(resp)
-        if img:
-            fd, path = tempfile.mkstemp(prefix="gemimg_", suffix=".png")
-            with os.fdopen(fd, "wb") as f:
-                f.write(img)
-            return path
-    except Exception as e:
-        print(f"[!] imagen-3.0-generate-001 gagal: {e}")
-
-    # Prioritas 2: gemini-2.0-flash (kapan-kapan bisa mengeluarkan IMAGE)
-    try:
-        model = genai.GenerativeModel(
-            "gemini-2.0-flash",
-            generation_config={"response_modalities": ["IMAGE"]},
-        )
-        resp = model.generate_content(prompt)
-        img = image_resp_to_bytes(resp)
-        if img:
-            fd, path = tempfile.mkstemp(prefix="gemimg_", suffix=".png")
-            with os.fdopen(fd, "wb") as f:
-                f.write(img)
-            return path
-    except Exception as e:
-        print(f"[!] gemini-2.0-flash(image) gagal: {e}")
-
+    # Try each model without unsupported generation_config fields
+    for model_name in IMAGE_MODELS:
+        try:
+            model = genai.GenerativeModel(model_name)
+            resp  = model.generate_content(prompt)
+            img   = image_resp_to_bytes(resp)
+            if img:
+                fd, path = tempfile.mkstemp(prefix="gemimg_", suffix=".png")
+                with os.fdopen(fd, "wb") as f:
+                    f.write(img)
+                return path
+        except Exception as e:
+            print(f"[!] {model_name} gagal: {e}")
+            continue
     return None
 
-# ====== FALLBACK IMAGE (lebih estetik) ======
+# ====== FALLBACK IMAGE (soft gradient + bokeh) ======
 def fallback_image(theme: str, style: str) -> str:
-    """Ilustrasi abstrak soft gradient + bokeh supaya lebih estetik."""
-    W, H = 1080, 1920  # portrait-friendly
-    base = Image.new("RGB", (W, H), (12, 14, 22))
-
-    # soft vertical gradient
-    top = np.array([30, 40, 75])
-    bottom = np.array([120, 60, 140])
+    """Ilustrasi abstrak lebih estetik (portrait)."""
+    W, H = 1080, 1920
+    # gradient vertikal halus
+    top = np.array([36, 44, 78], dtype=np.float32)
+    bottom = np.array([120, 62, 146], dtype=np.float32)
     grad = np.zeros((H, W, 3), dtype=np.uint8)
     for y in range(H):
         t = y / (H - 1)
         color = (1 - t) * top + t * bottom
         grad[y, :, :] = color
-    grad_img = Image.fromarray(grad, "RGB")
+    img = Image.fromarray(grad, "RGB")
 
-    # overlay bokeh circles lembut
+    # bokeh transparan
     rng = np.random.default_rng()
-    bokeh = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(bokeh)
-    for _ in range(24):
-        r = int(rng.integers(80, 220))
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    for _ in range(18):
+        r = int(rng.integers(90, 220))
         x = int(rng.integers(-r, W + r))
         y = int(rng.integers(-r, H + r))
-        col = (int(rng.integers(100, 200)), int(rng.integers(80, 190)), int(rng.integers(140, 240)), int(rng.integers(40, 90)))
+        col = (int(rng.integers(120, 210)), int(rng.integers(90, 190)), int(rng.integers(140, 240)), int(rng.integers(40, 90)))
         draw.ellipse([(x - r, y - r), (x + r, y + r)], fill=col)
-    bokeh = bokeh.filter(ImageFilter.GaussianBlur(12))
+    overlay = overlay.filter(ImageFilter.GaussianBlur(14))
+    img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
 
-    final = Image.alpha_composite(grad_img.convert("RGBA"), bokeh).convert("RGB")
-    # vignette halus
+    # vignette
     vign = Image.new("L", (W, H), 0)
     dv = ImageDraw.Draw(vign)
     dv.ellipse([(-int(W*0.15), -int(H*0.05)), (int(W*1.15), int(H*1.05))], fill=255)
     vign = vign.filter(ImageFilter.GaussianBlur(150))
-    final = Image.composite(final, Image.new("RGB", (W, H), (8, 8, 12)), vign)
+    img = Image.composite(img, Image.new("RGB", (W, H), (8, 8, 12)), vign)
 
     fp = os.path.join(tempfile.gettempdir(), f"fallback_{uuid.uuid4().hex}.jpg")
-    final.save(fp, "JPEG", quality=92)
+    img.save(fp, "JPEG", quality=92)
     return fp
 
 # ====== TELEGRAM UI ======
@@ -343,7 +328,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cap = gemini_make_caption(theme, style, lang)
         caption_html = fb_caption_html(cap["title"], cap["description"], cap["hashtags"])
 
-        # 2) Image via Gemini (prioritas) → fallback jika gagal
+        # 2) Image via Gemini → fallback jika gagal
         img_path = gemini_generate_image(theme, style, lang)
         used = "Gemini Image"
         if not img_path:
@@ -384,4 +369,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-v
