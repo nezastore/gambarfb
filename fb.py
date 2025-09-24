@@ -28,7 +28,6 @@ if not GEMINI_API_KEY:
 # ====== libs ======
 import feedparser, requests, numpy as np
 from PIL import Image, ImageDraw, ImageFont
-# Pillow 10 shim (ANTIALIAS dihapus)
 try:
     from PIL.Image import Resampling
     if not hasattr(Image, "ANTIALIAS"):
@@ -50,7 +49,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters,
     CallbackQueryHandler
 )
-from telegram.error import BadRequest   # ← untuk fallback edit pesan
+from telegram.error import BadRequest
 import google.generativeai as genai
 genai.configure(api_key=GEMINI_API_KEY)
 
@@ -62,7 +61,6 @@ def pick_gemini_model() -> str:
 GEMINI_MODEL = pick_gemini_model()
 
 # ====== state ======
-# per chat: video_path (optional), use_builtin_bg (bool), mode, lang, variants
 SESSION: Dict[int, Dict[str, str]] = {}
 JOB_QUEUE: "asyncio.Queue[dict]" = asyncio.Queue()
 WORKER_STARTED = False
@@ -73,7 +71,7 @@ DEF_LANG = "id"
 DEF_VAR  = 4
 CANVAS_W = 1080
 CANVAS_H = 1920
-BUILTIN_BG_DURATION = 45  # detik (dipakai jika pakai BG bawaan)
+BUILTIN_BG_DURATION = 45
 
 # ---------- helpers sumber ----------
 def fetch_google_news(topic: str, lang="id", region="ID", limit=5):
@@ -188,10 +186,6 @@ def have_ffmpeg()->bool:
     return shutil.which("ffmpeg") is not None
 
 def normalize_video(inp_path:str)->str:
-    """
-    Transcode ke H.264 yuv420p + AAC 44.1kHz + 30fps + faststart
-    agar sumber selalu kompatibel. Kembalikan path output sementara.
-    """
     if not have_ffmpeg():
         return inp_path
     out_path=os.path.join(tempfile.mkdtemp(prefix="norm_"), "norm.mp4")
@@ -205,7 +199,7 @@ def normalize_video(inp_path:str)->str:
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     if os.path.exists(out_path) and os.path.getsize(out_path)>0:
         return out_path
-    return inp_path  # fallback
+    return inp_path
 
 # ---------- canvas fit ----------
 def fit_to_canvas(clip: VideoFileClip, W: int, H: int) -> CompositeVideoClip:
@@ -217,36 +211,21 @@ def fit_to_canvas(clip: VideoFileClip, W: int, H: int) -> CompositeVideoClip:
     bg = ColorClip((W,H), color=(0,0,0)).set_duration(clip.duration)
     return CompositeVideoClip([bg, resized.set_position((x,y))])
 
-# ---------- built-in BG (tanpa musik) ----------
+# ---------- built-in BG ----------
 def generate_builtin_bg(duration: float, W: int, H: int, fps: int = 30) -> str:
-    """
-    Buat background abstrak (gradient bergerak) tanpa audio.
-    Disimpan ke file mp4 dan mengembalikan path-nya.
-    """
     def make_frame(t):
-        # gradient bergerak halus pakai sin/cos
         y = np.linspace(0, 1, H).reshape(H, 1)
         x = np.linspace(0, 1, W).reshape(1, W)
-        # warna dasar (biru ke ungu)
         r = 60 + 40*np.sin(2*np.pi*(x*0.6 + t*0.05))
         g = 60 + 40*np.sin(2*np.pi*(y*0.6 + t*0.07))
         b = 120 + 80*np.sin(2*np.pi*(x*0.3 + y*0.3 + t*0.04))
-        frame = np.stack([r, g, b], axis=2).astype(np.uint8)
-        return frame
+        return np.stack([r, g, b], axis=2).astype(np.uint8)
 
-    clip = VideoClip(make_frame, duration=duration)
-    clip = clip.resize((W, H))
+    clip = VideoClip(make_frame, duration=duration).resize((W, H))
     out_path = os.path.join(tempfile.mkdtemp(prefix="bg_"), "builtin_bg.mp4")
     clip.write_videofile(
-        out_path,
-        codec="libx264",
-        audio=False,
-        fps=fps,
-        threads=2,
-        preset="medium",
-        bitrate="3000k",
-        ffmpeg_params=["-pix_fmt","yuv420p","-movflags","+faststart"],
-        logger=None,
+        out_path, codec="libx264", audio=False, fps=fps, threads=2, preset="medium",
+        bitrate="3000k", ffmpeg_params=["-pix_fmt","yuv420p","-movflags","+faststart"], logger=None
     )
     try: clip.close()
     except: pass
@@ -254,34 +233,21 @@ def generate_builtin_bg(duration: float, W: int, H: int, fps: int = 30) -> str:
 
 # ---------- render ----------
 def render(bg_path:str, overlay_lines:List[str], credits:str, out_path:str, force_duration:float|None=None)->float:
-    """
-    Jika force_duration diset (mis. BG bawaan), pakai durasi tsb.
-    Jika tidak, durasi mengikuti durasi video background asli.
-    """
     if force_duration is not None:
-        src_norm = bg_path  # sudah kita buat sendiri (builtin), aman
+        base_clip = VideoFileClip(bg_path, audio=False)
         duration = float(force_duration)
-        fps = 30
-        # pakai video builtin sebagai 'base'
-        base_clip = VideoFileClip(src_norm, audio=False)
         base = fit_to_canvas(base_clip, CANVAS_W, CANVAS_H)
-        # panel + teks
-        panel_h=int(CANVAS_H*0.32); panel_y=int(CANVAS_H*0.6)
-        panel=(ColorClip(size=(CANVAS_W,panel_h), color=(0,0,0))
-               .set_opacity(0.35).set_duration(base.duration)
-               .set_position(("center", panel_y - panel_h//2)))
     else:
         src_norm = normalize_video(bg_path)
         clip = VideoFileClip(src_norm, audio=True)
         duration=float(clip.duration)
-        fps=int(round(getattr(clip,"fps",30) or 30))
         base = fit_to_canvas(clip, CANVAS_W, CANVAS_H)
-        panel_h=int(CANVAS_H*0.32); panel_y=int(CANVAS_H*0.6)
-        panel=(ColorClip(size=(CANVAS_W,panel_h), color=(0,0,0))
-               .set_opacity(0.35).set_duration(base.duration)
-               .set_position(("center", panel_y - panel_h//2)))
 
-    # Teks
+    panel_h=int(CANVAS_H*0.32); panel_y=int(CANVAS_H*0.6)
+    panel=(ColorClip(size=(CANVAS_W,panel_h), color=(0,0,0))
+           .set_opacity(0.35).set_duration(base.duration)
+           .set_position(("center", panel_y - panel_h//2)))
+
     joined="\n".join(overlay_lines)
     fs=max(28,int(CANVAS_H*0.04))
     t_w=int(CANVAS_W*0.88); t_h=panel_h-int(panel_h*0.2)
@@ -289,7 +255,6 @@ def render(bg_path:str, overlay_lines:List[str], credits:str, out_path:str, forc
     txt = (ImageClip(np.array(t_img)).set_duration(base.duration)
            .set_position(("center", panel_y - int(panel_h*0.1))))
 
-    # Credits
     c_fs=max(20,int(CANVAS_H*0.025))
     c_w, c_h = int(CANVAS_W*0.5), int(CANVAS_H*0.06)
     c_img = text_image(credits, c_w, c_h, c_fs, "left", stroke=max(1,c_fs//10))
@@ -297,33 +262,22 @@ def render(bg_path:str, overlay_lines:List[str], credits:str, out_path:str, forc
             .set_position((int(CANVAS_W*0.02), int(CANVAS_H*0.94)-c_h)))
 
     final = CompositeVideoClip([base, panel, txt, cred])
-    # audio: kalau source punya audio, bawa
     try:
         if getattr(base, "audio", None) is not None:
             final = final.set_audio(base.audio)
     except: pass
 
     final.write_videofile(
-        out_path,
-        codec="libx264",
-        audio_codec="aac",
-        audio=bool(getattr(final,"audio",None)),
-        fps=int(round(fps)),
-        threads=2,
-        preset="medium",
-        bitrate="3500k",
-        ffmpeg_params=["-pix_fmt","yuv420p","-movflags","+faststart"],
+        out_path, codec="libx264", audio_codec="aac",
+        audio=bool(getattr(final,"audio",None)), fps=30, threads=2, preset="medium",
+        bitrate="3500k", ffmpeg_params=["-pix_fmt","yuv420p","-movflags","+faststart"],
         temp_audiofile=os.path.join(tempfile.gettempdir(), f"tmp_audio_{uuid.uuid4().hex}.m4a"),
-        remove_temp=True,
-        logger=None,
+        remove_temp=True, logger=None,
     )
-
-    # Tutup
     try: final.close()
     except: pass
     try: base.close()
     except: pass
-
     if not os.path.exists(out_path) or os.path.getsize(out_path)==0:
         raise RuntimeError("Render gagal: file output kosong.")
     return duration
@@ -365,10 +319,8 @@ def _menu(chat_id:int)->Tuple[str,InlineKeyboardMarkup]:
 
 # ---------- Telegram handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Tampilkan menu tombol sejak /start (tanpa perlu kirim video)."""
     cid = update.effective_chat.id
     _init_defaults(cid)
-    # Info + menu
     await update.message.reply_text(
         "👋 Kirim video MP4 (Shorts/Reels) **atau** klik tombol *Pakai BG bawaan*.\n"
         f"Bot akan normalize codec, resize 9:16 ({CANVAS_W}x{CANVAS_H}), "
@@ -378,7 +330,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
 
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Munculkan ulang menu kapan saja dengan /menu."""
     cid = update.effective_chat.id
     if cid not in SESSION:
         _init_defaults(cid)
@@ -401,14 +352,11 @@ async def save_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text,reply_markup=kb,parse_mode="Markdown")
 
 async def _safe_edit(q, text, kb):
-    """Edit pesan dengan aman: coba edit teks+markup; jika sama → hanya markup."""
     try:
         await q.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
     except BadRequest:
-        try:
-            await q.edit_message_reply_markup(reply_markup=kb)
-        except Exception:
-            pass
+        try: await q.edit_message_reply_markup(reply_markup=kb)
+        except Exception: pass
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
@@ -421,19 +369,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if k=="mode": SESSION[cid]["mode"]=v
             elif k=="lang": SESSION[cid]["lang"]=v
             elif k=="var": SESSION[cid]["variants"]=max(3,min(5,int(v)))
-            text,kb=_menu(cid)
-            await _safe_edit(q, text, kb)
-            return
+            text,kb=_menu(cid); await _safe_edit(q, text, kb); return
         if data[0]=="bg":
             SESSION[cid]["use_builtin_bg"] = (data[1]=="auto")
-            text,kb=_menu(cid)
-            await _safe_edit(q, text, kb)
-            return
+            text,kb=_menu(cid); await _safe_edit(q, text, kb); return
         if data[0]=="reset":
-            _init_defaults(cid)
-            text,kb=_menu(cid)
-            await _safe_edit(q, text, kb)
-            return
+            _init_defaults(cid); text,kb=_menu(cid); await _safe_edit(q, text, kb); return
         if data[0]=="go":
             st=SESSION[cid]
             job={"chat_id":cid,"mode":st["mode"],"lang":st["lang"],"variants":int(st["variants"])}
@@ -446,11 +387,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 job["bg_path"]=vp
                 job["use_builtin_bg"]=False
             await JOB_QUEUE.put(job)
-            await q.edit_message_text(
+
+            msg = (
                 f"🧾 Job ditambahkan: {job['mode']}/{job['lang']}, variants={job['variants']}.\n"
-                ("BG: bawaan (tanpa musik)" if job["use_builtin_bg"] else "BG: video kamu (ikuti durasi)")
+                + ("BG: bawaan (tanpa musik)" if job["use_builtin_bg"] else "BG: video kamu (ikuti durasi)")
                 + "\nMenunggu giliran…"
             )
+            await q.edit_message_text(msg)
+
             global WORKER_STARTED
             if not WORKER_STARTED:
                 WORKER_STARTED=True
@@ -466,7 +410,6 @@ async def worker(app: Application):
         cid=job["chat_id"]
         try:
             await app.bot.send_message(cid,"⏳ Memproses: ambil sumber → Gemini → render…")
-            # sumber
             if job["mode"]=="news":
                 news=[]
                 for t in ["trending","viral","breaking","unik","teknologi","hiburan"]:
@@ -495,7 +438,6 @@ async def worker(app: Application):
             out_video=os.path.join(outdir,f"short_{uuid.uuid4().hex}.mp4")
 
             if job.get("use_builtin_bg"):
-                # buat BG bawaan, render dengan durasi tetap
                 bg_file = generate_builtin_bg(BUILTIN_BG_DURATION, CANVAS_W, CANVAS_H, fps=30)
                 duration = render(bg_file, overlay, credits, out_video, force_duration=BUILTIN_BG_DURATION)
             else:
@@ -503,7 +445,7 @@ async def worker(app: Application):
 
             cap=os.path.join(outdir,"caption_variants.txt")
             with open(cap,"w",encoding="utf-8") as f:
-                for i,v in enumerate(variants, 1):
+                for i,v in enumerate(variants,1):
                     t=(v.get("title") or "").strip()
                     hs=[h if h.startswith("#") else "#"+h for h in (v.get("hashtags",[]) or [])]
                     f.write(f"[{i}] {t}\n"); f.write(" ".join(hs)+"\n\n")
@@ -533,7 +475,7 @@ async def worker(app: Application):
 def main():
     app=Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("menu", menu_cmd))  # bisa panggil menu kapan saja
+    app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, save_video))
     app.add_handler(CallbackQueryHandler(on_button))
     print(f"Bot running... (Gemini {GEMINI_MODEL}; canvas {CANVAS_W}x{CANVAS_H}; durasi ikut background; BG bawaan tersedia)")
