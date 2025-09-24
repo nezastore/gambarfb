@@ -2,17 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 Telegram bot: News/Facts → Caption Variants (judul + hashtag) + Image
-- Tanpa overlay/render video
+- Tanpa video/overlay
 - Sumber: Google News (mode "news") / Wikipedia Random Summary (mode "facts")
 - Gemini menghasilkan 3–5 varian caption per artikel
-- Kirim gambar (thumbnail) + caption varian-1
-- Carousel varian dengan tombol Prev/Next (edit caption di foto yang sama)
-- Tombol untuk melihat semua varian sekaligus
+- Kirim gambar (thumbnail dari artikel jika ada; kalau tidak, generate ilustrasi via Gemini)
+- Carousel varian dengan tombol Prev/Next (edit caption foto yang sama)
+- Tombol untuk melihat semua varian & Reset
 """
 
-import os, re, json, uuid, asyncio, feedparser, requests, html
+import os, re, json, uuid, asyncio, feedparser, requests, html, base64, tempfile
 from datetime import datetime, timezone
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -24,7 +24,7 @@ if not GEMINI_API_KEY:
     print("⚠️ GEMINI_API_KEY kosong. Fitur AI bisa gagal.")
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 )
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, CallbackQueryHandler
@@ -35,7 +35,7 @@ from telegram.error import BadRequest
 import google.generativeai as genai
 genai.configure(api_key=GEMINI_API_KEY)
 
-def pick_gemini_model() -> str:
+def pick_gemini_text_model() -> str:
     for m in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]:
         try:
             _ = genai.GenerativeModel(m)
@@ -44,19 +44,26 @@ def pick_gemini_model() -> str:
             continue
     return "gemini-1.5-flash"
 
-GEMINI_MODEL = pick_gemini_model()
+# urutan kandidat model image yg umum tersedia (akan dicoba satu per satu)
+IMAGE_MODELS = [
+    # Gemini 2.5 image (preview) — pengganti 2.0 image-gen yang deprecated
+    "gemini-2.5-flash-image-preview",
+    # Model image via Gemini API (alias Imagen family)
+    "imagen-3.0-generate-001",
+    "imagen-3.0",
+]
+
+TEXT_MODEL = pick_gemini_text_model()
 
 # ====== STATE ======
-# per-chat pengaturan
-CHAT_CONF: Dict[int, Dict] = {}  # {chat_id: {"mode":"news"|"facts", "lang":"id"|"en", "variants": 3..5, "count": 3}}
-# state varian per pesan foto
-MSG_STATE: Dict[Tuple[int, int], Dict] = {}  # {(chat_id, message_id): {"variants":[{title,hashtags}], "index":0}}
+CHAT_CONF: Dict[int, Dict] = {}  # {chat_id: {"mode","lang","variants","count"}}
+MSG_STATE: Dict[Tuple[int, int], Dict] = {}  # {(chat_id, message_id): {"variants":[{title,hashtags}], "index":0, "url":str}}
 
 # ====== DEFAULTS ======
 DEF_MODE = "news"
 DEF_LANG = "id"
 DEF_VAR  = 4     # jumlah varian caption
-DEF_CNT  = 3     # jumlah artikel yang diambil tiap fetch
+DEF_CNT  = 3     # jumlah artikel per fetch
 
 # ==========================
 # Fetch Sumber
@@ -67,7 +74,6 @@ def fetch_google_news(query: str, lang="id", region="ID", limit=5) -> List[Dict]
     feed = feedparser.parse(url)
     items = []
     for e in feed.entries[:limit]:
-        # Ambil thumbnail jika ada
         img = ""
         try:
             if "media_content" in e and e.media_content:
@@ -127,7 +133,7 @@ Language: {locale}.
 Given this source (one article):
 {src_blob}
 
-Write {nvar} different social-media caption variants, for Facebook/Shorts:
+Write {nvar} different social-media caption variants for Facebook/Shorts:
 - Each variant must include:
   - "title": a catchy rewritten headline (<= 75 characters)
   - "hashtags": 20 hashtags, lowercase, with '#', no spaces. If language is Indonesian, include ~5 Indonesia-specific tags.
@@ -140,14 +146,14 @@ Return STRICT JSON:
 }}
 """
     try:
-        model = genai.GenerativeModel(GEMINI_MODEL)
+        model = genai.GenerativeModel(TEXT_MODEL)
         resp = model.generate_content(prompt)
         text = (resp.text or "").strip()
         text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
         data = json.loads(text)
         arr = data.get("variants", [])
         arr = [v for v in arr if isinstance(v, dict) and v.get("title") and isinstance(v.get("hashtags"), list)]
-        # clamp jumlah
+        # clamp
         arr = arr[:max(1, min(5, nvar))]
         if not arr:
             raise ValueError("no variants")
@@ -160,6 +166,82 @@ Return STRICT JSON:
                          "#explore", "#viralindonesia", "#indonesia", "#wow", "#keren",
                          "#inspirasi", "#hiburan", "#edukasi"]
         }]
+
+# ==========================
+# Gemini image generation (fallback ketika item tidak punya image)
+# ==========================
+def extract_image_bytes_from_response(resp) -> Optional[bytes]:
+    """
+    Cari part image (inline_data) dari response Gemini dan kembalikan bytes-nya.
+    Format SDK bisa berbeda-beda; fungsi ini berusaha robust.
+    """
+    try:
+        # pola umum: resp.candidates[0].content.parts[*].inline_data
+        cands = getattr(resp, "candidates", None) or []
+        for c in cands:
+            content = getattr(c, "content", None)
+            if not content: continue
+            parts = getattr(content, "parts", []) or []
+            for p in parts:
+                inline = getattr(p, "inline_data", None) or getattr(p, "inlineData", None)
+                if inline and getattr(inline, "data", None):
+                    return base64.b64decode(inline.data)
+        # beberapa SDK menaruh langsung di resp.parts
+        parts = getattr(resp, "parts", []) or []
+        for p in parts:
+            inline = getattr(p, "inline_data", None) or getattr(p, "inlineData", None)
+            if inline and getattr(inline, "data", None):
+                return base64.b64decode(inline.data)
+    except Exception:
+        pass
+    return None
+
+def build_image_prompt_from_item(item: Dict, lang: str) -> str:
+    locale = "Bahasa Indonesia" if lang == "id" else "English"
+    title = item.get("title") or ""
+    summ  = item.get("summary") or ""
+    topic = title if title else summ[:140]
+    desc = f"""
+Create a high-quality illustrative social-media thumbnail relevant to this topic:
+"{topic}"
+
+Style: news feature / documentary photo, clean composition, high contrast, no text, no watermark, vertical-friendly.
+Output: 1024x1024, photorealistic or illustrative depending on topic.
+
+Language context: {locale}.
+"""
+    return desc
+
+def gemini_generate_image_file(item: Dict, lang: str = "id") -> Optional[str]:
+    """
+    Coba generate image menggunakan beberapa model image Gemini/Imagen.
+    Return path file PNG/JPG sementara, atau None jika gagal.
+    """
+    prompt = build_image_prompt_from_item(item, lang)
+    for model_name in IMAGE_MODELS:
+        try:
+            model = genai.GenerativeModel(
+                model_name,
+                # beberapa SDK butuh config modal image
+                generation_config={
+                    "response_modalities": ["IMAGE"],  # arahkan supaya balikan gambar
+                }
+            )
+            resp = model.generate_content(prompt)
+            img_bytes = extract_image_bytes_from_response(resp)
+            if not img_bytes:
+                # beberapa model balikan link base64 di resp.text (jarang)
+                if getattr(resp, "text", None) and "data:image" in resp.text:
+                    b64 = resp.text.split("base64,")[-1].split('"')[0].strip()
+                    img_bytes = base64.b64decode(b64)
+            if img_bytes:
+                fd, path = tempfile.mkstemp(prefix="gemimg_", suffix=".png")
+                with os.fdopen(fd, "wb") as f:
+                    f.write(img_bytes)
+                return path
+        except Exception:
+            continue
+    return None
 
 # ==========================
 # Helpers UI
@@ -182,12 +264,13 @@ def build_menu(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
     cnt  = int(st.get("count", DEF_CNT))
 
     text = (
-        "🗞️ **Generator Caption Berita/Fakta**\n\n"
+        "🗞️ **Generator Caption + Gambar (Gemini)**\n\n"
         f"- Mode: `{mode}`\n"
         f"- Bahasa: `{lang}`\n"
         f"- Varian per artikel: `{nvar}`\n"
         f"- Jumlah artikel: `{cnt}`\n\n"
-        "Klik *Ambil & Buat* untuk men-generate caption + gambar."
+        "Klik *Ambil & Buat* untuk men-generate caption + gambar.\n"
+        "Jika sumber tidak punya gambar, bot akan membuat ilustrasi via Gemini."
     )
 
     kb = [
@@ -233,6 +316,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Selamat datang!\nBot ini akan mengambil berita/fakta, "
         "membuat beberapa varian judul + hashtag dengan Gemini, dan mengirim gambar + caption.\n"
+        "Kalau sumber tidak punya gambar, bot akan membuat ilustrasi otomatis via Gemini.\n\n"
         "Atur preferensi di bawah ini:",
         disable_web_page_preview=True
     )
@@ -267,8 +351,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Reset
     if data[0] == "reset":
         CHAT_CONF.pop(cid, None)
-        MSG_STATE_keys = [k for k in list(MSG_STATE.keys()) if k[0] == cid]
-        for k in MSG_STATE_keys:
+        for k in [k for k in list(MSG_STATE.keys()) if k[0] == cid]:
             MSG_STATE.pop(k, None)
         init_chat(cid)
         text, kb = build_menu(cid)
@@ -280,7 +363,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data[0] == "go":
         st = CHAT_CONF[cid]
         mode = st["mode"]; lang = st["lang"]; nvar = int(st["variants"]); cnt = int(st["count"])
-        await q.edit_message_text("⏳ Mengambil sumber & membuat caption dengan Gemini…")
+        await q.edit_message_text("⏳ Mengambil sumber & membuat caption/gambar dengan Gemini…")
 
         # Ambil sumber
         sources: List[Dict] = []
@@ -313,22 +396,39 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Kirim tiap artikel (gambar + varian-1) dengan tombol carousel varian
         for item in sources:
             try:
+                # 1) Buat varian caption
                 variants = gemini_variants_for_item(item, lang=lang, nvar=nvar)
-                # Simpan state per message setelah kirim
-                # Caption awal = varian-1
                 v0 = variants[0]
                 caption_html = build_caption_html(v0.get("title", "Konten Menarik"),
                                                   v0.get("hashtags", []),
                                                   item.get("url", ""))
 
-                # Kirim foto kalau ada, kalau tidak kirim pesan teks
+                # 2) Pilih gambar: thumbnail asli kalau ada, kalau tidak → generate via Gemini
+                img_path = None
                 if item.get("image"):
-                    sent = await context.bot.send_photo(
-                        cid, photo=item["image"],
-                        caption=caption_html,
-                        parse_mode="HTML",
-                        reply_markup=kb_for_variants()
-                    )
+                    # download dulu supaya stabil ketika send_photo
+                    try:
+                        r = requests.get(item["image"], timeout=10)
+                        if r.status_code == 200:
+                            fd, img_path = tempfile.mkstemp(prefix="newsimg_", suffix=".jpg")
+                            with os.fdopen(fd, "wb") as f:
+                                f.write(r.content)
+                    except Exception:
+                        img_path = None
+
+                if not img_path:
+                    # fallback: generate image via Gemini
+                    gen_path = gemini_generate_image_file(item, lang=lang)
+                    img_path = gen_path  # bisa None jika gagal
+
+                # 3) Kirim: foto jika ada file; kalau tidak ada sama sekali → kirim caption teks
+                if img_path and os.path.exists(img_path):
+                    with open(img_path, "rb") as f:
+                        sent = await context.bot.send_photo(
+                            cid, photo=InputFile(f, filename="image.png"),
+                            caption=caption_html, parse_mode="HTML",
+                            reply_markup=kb_for_variants()
+                        )
                     mid = sent.message_id
                 else:
                     sent = await context.bot.send_message(
@@ -338,14 +438,14 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     mid = sent.message_id
 
-                # Simpan variants & index di MSG_STATE
+                # 4) Simpan state varian untuk tombol Prev/Next
                 MSG_STATE[(cid, mid)] = {
                     "variants": variants,
                     "index": 0,
                     "url": item.get("url", "")
                 }
 
-                # Kirim info sumber (judul asli + link) sebagai balasan terpisah (opsional)
+                # Info sumber (opsional)
                 src_title = item.get("title") or "(tanpa judul)"
                 await context.bot.send_message(
                     cid,
@@ -408,7 +508,7 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_cb))
-    print(f"Bot running... (Gemini {GEMINI_MODEL})")
+    print(f"Bot running... (Text model: {TEXT_MODEL}; Image models fallback: {', '.join(IMAGE_MODELS)})")
     app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
