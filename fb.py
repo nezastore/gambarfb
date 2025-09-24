@@ -50,6 +50,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters,
     CallbackQueryHandler
 )
+from telegram.error import BadRequest   # ← untuk fallback edit pesan
 import google.generativeai as genai
 genai.configure(api_key=GEMINI_API_KEY)
 
@@ -364,13 +365,25 @@ def _menu(chat_id:int)->Tuple[str,InlineKeyboardMarkup]:
 
 # ---------- Telegram handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid=update.effective_chat.id
-    SESSION.pop(cid, None)
+    """Tampilkan menu tombol sejak /start (tanpa perlu kirim video)."""
+    cid = update.effective_chat.id
+    _init_defaults(cid)
+    # Info + menu
     await update.message.reply_text(
         "👋 Kirim video MP4 (Shorts/Reels) **atau** klik tombol *Pakai BG bawaan*.\n"
         f"Bot akan normalize codec, resize 9:16 ({CANVAS_W}x{CANVAS_H}), "
         "dan **durasi output mengikuti background**."
     )
+    text, kb = _menu(cid)
+    await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
+
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Munculkan ulang menu kapan saja dengan /menu."""
+    cid = update.effective_chat.id
+    if cid not in SESSION:
+        _init_defaults(cid)
+    text, kb = _menu(cid)
+    await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
 
 async def save_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid=update.effective_chat.id
@@ -387,6 +400,16 @@ async def save_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Video disimpan.")
     await update.message.reply_text(text,reply_markup=kb,parse_mode="Markdown")
 
+async def _safe_edit(q, text, kb):
+    """Edit pesan dengan aman: coba edit teks+markup; jika sama → hanya markup."""
+    try:
+        await q.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+    except BadRequest:
+        try:
+            await q.edit_message_reply_markup(reply_markup=kb)
+        except Exception:
+            pass
+
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
     cid=q.message.chat_id
@@ -399,27 +422,17 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif k=="lang": SESSION[cid]["lang"]=v
             elif k=="var": SESSION[cid]["variants"]=max(3,min(5,int(v)))
             text,kb=_menu(cid)
-            if q.message.text!=text: await q.edit_message_text(text,reply_markup=kb,parse_mode="Markdown")
-            else: await q.edit_message_reply_markup(reply_markup=kb)
+            await _safe_edit(q, text, kb)
             return
         if data[0]=="bg":
-            if data[1]=="auto":
-                SESSION[cid]["use_builtin_bg"]=True
-                text,kb=_menu(cid)
-                if q.message.text!=text: await q.edit_message_text(text,reply_markup=kb,parse_mode="Markdown")
-                else: await q.edit_message_reply_markup(reply_markup=kb)
-                return
-            if data[1]=="user":
-                SESSION[cid]["use_builtin_bg"]=False
-                text,kb=_menu(cid)
-                if q.message.text!=text: await q.edit_message_text(text,reply_markup=kb,parse_mode="Markdown")
-                else: await q.edit_message_reply_markup(reply_markup=kb)
-                return
+            SESSION[cid]["use_builtin_bg"] = (data[1]=="auto")
+            text,kb=_menu(cid)
+            await _safe_edit(q, text, kb)
+            return
         if data[0]=="reset":
             _init_defaults(cid)
             text,kb=_menu(cid)
-            if q.message.text!=text: await q.edit_message_text(text,reply_markup=kb,parse_mode="Markdown")
-            else: await q.edit_message_reply_markup(reply_markup=kb)
+            await _safe_edit(q, text, kb)
             return
         if data[0]=="go":
             st=SESSION[cid]
@@ -490,7 +503,7 @@ async def worker(app: Application):
 
             cap=os.path.join(outdir,"caption_variants.txt")
             with open(cap,"w",encoding="utf-8") as f:
-                for i,v in enumerate(variants,1):
+                for i,v in enumerate(variants, 1):
                     t=(v.get("title") or "").strip()
                     hs=[h if h.startswith("#") else "#"+h for h in (v.get("hashtags",[]) or [])]
                     f.write(f"[{i}] {t}\n"); f.write(" ".join(hs)+"\n\n")
@@ -520,6 +533,7 @@ async def worker(app: Application):
 def main():
     app=Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu_cmd))  # bisa panggil menu kapan saja
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, save_video))
     app.add_handler(CallbackQueryHandler(on_button))
     print(f"Bot running... (Gemini {GEMINI_MODEL}; canvas {CANVAS_W}x{CANVAS_H}; durasi ikut background; BG bawaan tersedia)")
