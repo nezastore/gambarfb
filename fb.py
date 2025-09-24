@@ -2,12 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 Telegram bot: Viral News / Fakta Unik -> Video Overlay (Shorts)
-- UI tombol (mode/bahasa/variants, durasi ikut background)
+- UI tombol (mode/bahasa/variants, BG bawaan, render, reset)
+- Jika ada video dari user → durasi output mengikuti video background
+- Jika tidak ada video → bisa pakai "BG bawaan" (animasi gradient, no audio)
 - Tanpa ImageMagick (Pillow -> ImageClip)
 - Auto-resize 9:16 (default 1080x1920)
 - Kompatibel Pillow 10+ (shim Resampling)
-- Pre-normalize input ke H.264/AAC (yuv420p 30fps) dengan ffmpeg
-- Output streamable (yuv420p + faststart) + audio
+- Pre-normalize input ke H.264/AAC (yuv420p 30fps) dengan ffmpeg (jika tersedia)
+- Output streamable (yuv420p + faststart) + audio (jika background punya audio)
 """
 
 import os, re, json, uuid, tempfile, asyncio, subprocess, shutil
@@ -39,7 +41,7 @@ except Exception:
     pass
 
 from moviepy.editor import (
-    VideoFileClip, CompositeVideoClip, ColorClip, ImageClip
+    VideoFileClip, CompositeVideoClip, ColorClip, ImageClip, VideoClip
 )
 from telegram import (
     Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
@@ -59,6 +61,7 @@ def pick_gemini_model() -> str:
 GEMINI_MODEL = pick_gemini_model()
 
 # ====== state ======
+# per chat: video_path (optional), use_builtin_bg (bool), mode, lang, variants
 SESSION: Dict[int, Dict[str, str]] = {}
 JOB_QUEUE: "asyncio.Queue[dict]" = asyncio.Queue()
 WORKER_STARTED = False
@@ -69,6 +72,7 @@ DEF_LANG = "id"
 DEF_VAR  = 4
 CANVAS_W = 1080
 CANVAS_H = 1920
+BUILTIN_BG_DURATION = 45  # detik (dipakai jika pakai BG bawaan)
 
 # ---------- helpers sumber ----------
 def fetch_google_news(topic: str, lang="id", region="ID", limit=5):
@@ -212,32 +216,79 @@ def fit_to_canvas(clip: VideoFileClip, W: int, H: int) -> CompositeVideoClip:
     bg = ColorClip((W,H), color=(0,0,0)).set_duration(clip.duration)
     return CompositeVideoClip([bg, resized.set_position((x,y))])
 
-def render(bg_path:str, overlay_lines:List[str], credits:str, out_path:str)->float:
+# ---------- built-in BG (tanpa musik) ----------
+def generate_builtin_bg(duration: float, W: int, H: int, fps: int = 30) -> str:
     """
-    Durasi ikut source, audio dibawa. Output H.264+AAC streamable.
-    Return: duration (sec)
+    Buat background abstrak (gradient bergerak) tanpa audio.
+    Disimpan ke file mp4 dan mengembalikan path-nya.
     """
-    # normalize input
-    src_norm = normalize_video(bg_path)
+    def make_frame(t):
+        # gradient bergerak halus pakai sin/cos
+        y = np.linspace(0, 1, H).reshape(H, 1)
+        x = np.linspace(0, 1, W).reshape(1, W)
+        # warna dasar (biru ke ungu)
+        r = 60 + 40*np.sin(2*np.pi*(x*0.6 + t*0.05))
+        g = 60 + 40*np.sin(2*np.pi*(y*0.6 + t*0.07))
+        b = 120 + 80*np.sin(2*np.pi*(x*0.3 + y*0.3 + t*0.04))
+        frame = np.stack([r, g, b], axis=2).astype(np.uint8)
+        return frame
 
-    clip = VideoFileClip(src_norm, audio=True)
-    duration=float(clip.duration)
-    fps=int(round(getattr(clip,"fps",30) or 30))
+    clip = VideoClip(make_frame, duration=duration)
+    clip = clip.resize((W, H))
+    out_path = os.path.join(tempfile.mkdtemp(prefix="bg_"), "builtin_bg.mp4")
+    clip.write_videofile(
+        out_path,
+        codec="libx264",
+        audio=False,
+        fps=fps,
+        threads=2,
+        preset="medium",
+        bitrate="3000k",
+        ffmpeg_params=["-pix_fmt","yuv420p","-movflags","+faststart"],
+        logger=None,
+    )
+    try: clip.close()
+    except: pass
+    return out_path
 
-    base = fit_to_canvas(clip, CANVAS_W, CANVAS_H)
-    # panel
-    panel_h=int(CANVAS_H*0.32); panel_y=int(CANVAS_H*0.6)
-    panel=(ColorClip(size=(CANVAS_W,panel_h), color=(0,0,0))
-           .set_opacity(0.35).set_duration(base.duration)
-           .set_position(("center", panel_y - panel_h//2)))
-    # text
+# ---------- render ----------
+def render(bg_path:str, overlay_lines:List[str], credits:str, out_path:str, force_duration:float|None=None)->float:
+    """
+    Jika force_duration diset (mis. BG bawaan), pakai durasi tsb.
+    Jika tidak, durasi mengikuti durasi video background asli.
+    """
+    if force_duration is not None:
+        src_norm = bg_path  # sudah kita buat sendiri (builtin), aman
+        duration = float(force_duration)
+        fps = 30
+        # pakai video builtin sebagai 'base'
+        base_clip = VideoFileClip(src_norm, audio=False)
+        base = fit_to_canvas(base_clip, CANVAS_W, CANVAS_H)
+        # panel + teks
+        panel_h=int(CANVAS_H*0.32); panel_y=int(CANVAS_H*0.6)
+        panel=(ColorClip(size=(CANVAS_W,panel_h), color=(0,0,0))
+               .set_opacity(0.35).set_duration(base.duration)
+               .set_position(("center", panel_y - panel_h//2)))
+    else:
+        src_norm = normalize_video(bg_path)
+        clip = VideoFileClip(src_norm, audio=True)
+        duration=float(clip.duration)
+        fps=int(round(getattr(clip,"fps",30) or 30))
+        base = fit_to_canvas(clip, CANVAS_W, CANVAS_H)
+        panel_h=int(CANVAS_H*0.32); panel_y=int(CANVAS_H*0.6)
+        panel=(ColorClip(size=(CANVAS_W,panel_h), color=(0,0,0))
+               .set_opacity(0.35).set_duration(base.duration)
+               .set_position(("center", panel_y - panel_h//2)))
+
+    # Teks
     joined="\n".join(overlay_lines)
     fs=max(28,int(CANVAS_H*0.04))
     t_w=int(CANVAS_W*0.88); t_h=panel_h-int(panel_h*0.2)
     t_img = text_image(joined, t_w, t_h, fs, "center", stroke=max(1,fs//14))
     txt = (ImageClip(np.array(t_img)).set_duration(base.duration)
            .set_position(("center", panel_y - int(panel_h*0.1))))
-    # credits
+
+    # Credits
     c_fs=max(20,int(CANVAS_H*0.025))
     c_w, c_h = int(CANVAS_W*0.5), int(CANVAS_H*0.06)
     c_img = text_image(credits, c_w, c_h, c_fs, "left", stroke=max(1,c_fs//10))
@@ -245,15 +296,18 @@ def render(bg_path:str, overlay_lines:List[str], credits:str, out_path:str)->flo
             .set_position((int(CANVAS_W*0.02), int(CANVAS_H*0.94)-c_h)))
 
     final = CompositeVideoClip([base, panel, txt, cred])
-    if base.audio is not None:
-        final = final.set_audio(base.audio)
+    # audio: kalau source punya audio, bawa
+    try:
+        if getattr(base, "audio", None) is not None:
+            final = final.set_audio(base.audio)
+    except: pass
 
     final.write_videofile(
         out_path,
         codec="libx264",
         audio_codec="aac",
-        audio=True,
-        fps=fps,
+        audio=bool(getattr(final,"audio",None)),
+        fps=int(round(fps)),
         threads=2,
         preset="medium",
         bitrate="3500k",
@@ -263,12 +317,10 @@ def render(bg_path:str, overlay_lines:List[str], credits:str, out_path:str)->flo
         logger=None,
     )
 
-    # tutup & flush
+    # Tutup
     try: final.close()
     except: pass
     try: base.close()
-    except: pass
-    try: clip.close()
     except: pass
 
     if not os.path.exists(out_path) or os.path.getsize(out_path)==0:
@@ -278,19 +330,22 @@ def render(bg_path:str, overlay_lines:List[str], credits:str, out_path:str)->flo
 # ---------- UI ----------
 def _init_defaults(chat_id:int):
     SESSION[chat_id]=SESSION.get(chat_id,{})
-    SESSION[chat_id].update({"mode":DEF_MODE,"lang":DEF_LANG,"variants":DEF_VAR})
+    SESSION[chat_id].update({"mode":DEF_MODE,"lang":DEF_LANG,"variants":DEF_VAR,"use_builtin_bg":False})
 
 def _label(cur,val,txt): return f"✅ {txt}" if cur==val else txt
 
 def _menu(chat_id:int)->Tuple[str,InlineKeyboardMarkup]:
     st=SESSION.get(chat_id,{})
     mode=st.get("mode",DEF_MODE); lang=st.get("lang",DEF_LANG); var=int(st.get("variants",DEF_VAR))
+    using_builtin = st.get("use_builtin_bg", False)
+    bg_status = "BG bawaan (tanpa musik)" if using_builtin else "Video kiriman (ikuti durasi)"
     text=(f"🎛 **Pengaturan**\n"
           f"- Mode: `{mode}`\n"
           f"- Bahasa: `{lang}`\n"
           f"- Variants judul/hashtag: `{var}`\n"
           f"- Canvas: `{CANVAS_W}x{CANVAS_H}` (9:16)\n"
-          f"- Durasi output: **mengikuti video background**\n\n"
+          f"- Background: **{bg_status}**\n"
+          f"- Durasi output: mengikuti background\n\n"
           f"Tekan tombol untuk mengubah, lalu **Render ▶️**.")
     kb=[
         [InlineKeyboardButton(_label(mode,"news","📰 News"),callback_data="set:mode:news"),
@@ -300,6 +355,8 @@ def _menu(chat_id:int)->Tuple[str,InlineKeyboardMarkup]:
         [InlineKeyboardButton(_label(var,3,"3 var"),callback_data="set:var:3"),
          InlineKeyboardButton(_label(var,4,"4 var"),callback_data="set:var:4"),
          InlineKeyboardButton(_label(var,5,"5 var"),callback_data="set:var:5")],
+        [InlineKeyboardButton("🎞 Pakai BG bawaan", callback_data="bg:auto"),
+         InlineKeyboardButton("📤 Pakai video saya", callback_data="bg:user")],
         [InlineKeyboardButton("▶️ Render",callback_data="go"),
          InlineKeyboardButton("🔁 Reset", callback_data="reset")]
     ]
@@ -310,8 +367,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid=update.effective_chat.id
     SESSION.pop(cid, None)
     await update.message.reply_text(
-        "👋 Kirim video MP4 (Shorts/Reels). Bot akan normalize codec, resize 9:16 "
-        f"({CANVAS_W}x{CANVAS_H}), dan **durasi mengikuti video**. Setelah terkirim, muncul menu tombol."
+        "👋 Kirim video MP4 (Shorts/Reels) **atau** klik tombol *Pakai BG bawaan*.\n"
+        f"Bot akan normalize codec, resize 9:16 ({CANVAS_W}x{CANVAS_H}), "
+        "dan **durasi output mengikuti background**."
     )
 
 async def save_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -324,6 +382,7 @@ async def save_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await tgfile.download_to_drive(local)
     _init_defaults(cid)
     SESSION[cid]["video_path"]=local
+    SESSION[cid]["use_builtin_bg"]=False
     text,kb=_menu(cid)
     await update.message.reply_text("✅ Video disimpan.")
     await update.message.reply_text(text,reply_markup=kb,parse_mode="Markdown")
@@ -331,9 +390,7 @@ async def save_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
     cid=q.message.chat_id
-    if not SESSION.get(cid) or not os.path.exists(SESSION[cid].get("video_path","")):
-        try: return await q.edit_message_text("❌ Belum ada video. Kirim video MP4 dulu.")
-        except: return
+    if cid not in SESSION: _init_defaults(cid)
     data=q.data.split(":")
     try:
         if data[0]=="set":
@@ -345,6 +402,19 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if q.message.text!=text: await q.edit_message_text(text,reply_markup=kb,parse_mode="Markdown")
             else: await q.edit_message_reply_markup(reply_markup=kb)
             return
+        if data[0]=="bg":
+            if data[1]=="auto":
+                SESSION[cid]["use_builtin_bg"]=True
+                text,kb=_menu(cid)
+                if q.message.text!=text: await q.edit_message_text(text,reply_markup=kb,parse_mode="Markdown")
+                else: await q.edit_message_reply_markup(reply_markup=kb)
+                return
+            if data[1]=="user":
+                SESSION[cid]["use_builtin_bg"]=False
+                text,kb=_menu(cid)
+                if q.message.text!=text: await q.edit_message_text(text,reply_markup=kb,parse_mode="Markdown")
+                else: await q.edit_message_reply_markup(reply_markup=kb)
+                return
         if data[0]=="reset":
             _init_defaults(cid)
             text,kb=_menu(cid)
@@ -353,12 +423,20 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if data[0]=="go":
             st=SESSION[cid]
-            job={"chat_id":cid,"bg_path":st["video_path"],"mode":st["mode"],
-                 "lang":st["lang"],"variants":int(st["variants"])}
+            job={"chat_id":cid,"mode":st["mode"],"lang":st["lang"],"variants":int(st["variants"])}
+            if st.get("use_builtin_bg",False):
+                job["use_builtin_bg"]=True
+            else:
+                vp=st.get("video_path")
+                if not vp or not os.path.exists(vp):
+                    return await q.edit_message_text("❌ Belum ada video. Kirim video MP4 atau pilih BG bawaan.")
+                job["bg_path"]=vp
+                job["use_builtin_bg"]=False
             await JOB_QUEUE.put(job)
             await q.edit_message_text(
-                f"🧾 Job ditambahkan: {job['mode']}/{job['lang']}, variants={job['variants']}. "
-                "Durasi mengikuti background. Menunggu giliran…"
+                f"🧾 Job ditambahkan: {job['mode']}/{job['lang']}, variants={job['variants']}.\n"
+                ("BG: bawaan (tanpa musik)" if job["use_builtin_bg"] else "BG: video kamu (ikuti durasi)")
+                + "\nMenunggu giliran…"
             )
             global WORKER_STARTED
             if not WORKER_STARTED:
@@ -402,7 +480,13 @@ async def worker(app: Application):
 
             outdir=tempfile.mkdtemp(prefix="out_")
             out_video=os.path.join(outdir,f"short_{uuid.uuid4().hex}.mp4")
-            duration = render(job["bg_path"], overlay, credits, out_video)
+
+            if job.get("use_builtin_bg"):
+                # buat BG bawaan, render dengan durasi tetap
+                bg_file = generate_builtin_bg(BUILTIN_BG_DURATION, CANVAS_W, CANVAS_H, fps=30)
+                duration = render(bg_file, overlay, credits, out_video, force_duration=BUILTIN_BG_DURATION)
+            else:
+                duration = render(job["bg_path"], overlay, credits, out_video)
 
             cap=os.path.join(outdir,"caption_variants.txt")
             with open(cap,"w",encoding="utf-8") as f:
@@ -438,7 +522,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, save_video))
     app.add_handler(CallbackQueryHandler(on_button))
-    print(f"Bot running... (Gemini {GEMINI_MODEL}; canvas {CANVAS_W}x{CANVAS_H}; durasi ikut background)")
+    print(f"Bot running... (Gemini {GEMINI_MODEL}; canvas {CANVAS_W}x{CANVAS_H}; durasi ikut background; BG bawaan tersedia)")
     app.run_polling(close_loop=False)
 
 if __name__=="__main__":
