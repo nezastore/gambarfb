@@ -4,26 +4,25 @@
 Telegram bot: Viral News / Fakta Unik -> Video Overlay (Shorts) + FULL Button UI
 - Tanpa ImageMagick (render teks via Pillow → ImageClip)
 - Queue render + carousel judul/hashtag
+- Auto-resize ke kanvas vertikal 9:16 (default 1080x1920)
 """
 
-import os, re, json, uuid, tempfile, asyncio, textwrap, math
+import os, re, json, uuid, tempfile, asyncio, textwrap
 from datetime import datetime, timezone
 from typing import List, Dict, Tuple
 
 # ====== ENV ======
 from dotenv import load_dotenv
 load_dotenv()
-
 TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 GEMINI_API_KEY     = (os.getenv("GEMINI_API_KEY") or "").strip()
-
 if not TELEGRAM_BOT_TOKEN or ":" not in TELEGRAM_BOT_TOKEN:
     raise SystemExit("❌ TELEGRAM_BOT_TOKEN tidak ditemukan/invalid. Cek file .env (KEY=VALUE).")
 if not GEMINI_API_KEY:
     print("⚠️ GEMINI_API_KEY kosong. Fitur AI bisa gagal.")
 
 # ====== Imports lib ======
-import feedparser, requests
+import feedparser, requests, numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from moviepy.editor import (
     VideoFileClip, CompositeVideoClip, ColorClip, ImageClip
@@ -57,6 +56,10 @@ DEF_MODE = "news"     # or "facts"
 DEF_LANG = "id"       # "id"/"en"
 DEF_DUR  = 60         # 20..90
 DEF_VAR  = 4          # 3..5
+
+# ====== Kanvas (ubah ke 720x1280 jika mau) ======
+CANVAS_W = 1080
+CANVAS_H = 1920
 
 # ---------- Sumber ----------
 def fetch_google_news(topic: str, lang="id", region="ID", limit=5):
@@ -110,7 +113,6 @@ Return strict JSON:
         text=(resp.text or "").strip()
         text=re.sub(r"^```(?:json)?|```$","",text,flags=re.MULTILINE).strip()
         data=json.loads(text)
-        # guards
         if not isinstance(data.get("variants",[]), list):
             data["variants"]=[]
         data["variants"]=data["variants"][:max(1,min(5,nvar))]
@@ -125,14 +127,13 @@ Return strict JSON:
 
 # ---------- UTIL TEKS PIL (tanpa ImageMagick) ----------
 def _find_font_path() -> str:
-    candidates = [
+    for p in [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
         "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-    ]
-    for p in candidates:
+    ]:
         if os.path.exists(p): return p
-    return ""  # Pillow default bitmap font fallback
+    return ""  # fallback bitmap
 
 def _wrap_pil(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> List[str]:
     lines=[]
@@ -145,16 +146,13 @@ def _wrap_pil(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont
             if draw.textlength(test, font=font) <= max_width:
                 cur=test
             else:
-                lines.append(cur)
-                cur=w
+                lines.append(cur); cur=w
         lines.append(cur)
     return lines
 
 def _text_image(text: str, box_w: int, box_h: int, fontsize: int, align: str="center",
                 stroke_w: int=2, fill=(255,255,255,255), stroke_fill=(0,0,0,255)) -> Image.Image:
-    """
-    Buat gambar RGBA berukuran (box_w x box_h) berisi text wrap+stroke.
-    """
+    """Buat gambar RGBA berisi text wrap+stroke sesuai kotak."""
     img = Image.new("RGBA", (box_w, box_h), (0,0,0,0))
     draw = ImageDraw.Draw(img)
     font_path = _find_font_path()
@@ -170,23 +168,33 @@ def _text_image(text: str, box_w: int, box_h: int, fontsize: int, align: str="ce
 
     for line in lines:
         w = int(draw.textlength(line, font=font))
-        if align == "center":
-            x = max(0, (box_w - w)//2)
-        elif align == "right":
-            x = max(0, box_w - w)
-        else:
-            x = 0
-        # stroke (outline)
+        if align == "center": x = max(0, (box_w - w)//2)
+        elif align == "right": x = max(0, box_w - w)
+        else: x = 0
         if stroke_w > 0:
             for dx in range(-stroke_w, stroke_w+1):
                 for dy in range(-stroke_w, stroke_w+1):
                     if dx==0 and dy==0: continue
                     draw.text((x+dx, y+dy), line, font=font, fill=stroke_fill)
-        # fill
         draw.text((x, y), line, font=font, fill=fill)
         y += line_h
-
     return img
+
+# ---------- FIT VIDEO KE KANVAS 9:16 ----------
+def fit_to_canvas(clip: VideoFileClip, canvas_w: int, canvas_h: int) -> CompositeVideoClip:
+    """
+    Letterbox 'contain':
+      - Buat canvas (hitam) ukuran (canvas_w x canvas_h)
+      - Resize video agar seluruhnya terlihat, center, tanpa crop
+    """
+    vw, vh = clip.size
+    scale = min(canvas_w / vw, canvas_h / vh)
+    new_w, new_h = int(vw * scale), int(vh * scale)
+    resized = clip.resize((new_w, new_h))
+    x = (canvas_w - new_w) // 2
+    y = (canvas_h - new_h) // 2
+    canvas = ColorClip((canvas_w, canvas_h), color=(0,0,0)).set_duration(clip.duration)
+    return CompositeVideoClip([canvas, resized.set_position((x, y))])
 
 # ---------- RENDER VIDEO DENGAN OVERLAY ----------
 def _tc_height_guess(panel_h:int)->int: return int(panel_h*0.1)
@@ -194,14 +202,16 @@ def _tc_height_guess(panel_h:int)->int: return int(panel_h*0.1)
 def render_video_with_overlay(bg_path: str, overlay_lines: List[str],
                               credits: str, out_path: str, target_duration: int = 60):
     """
-    Render tanpa ImageMagick:
-      - panel semi transparan (ColorClip)
-      - teks overlay & credits digambar via PIL → ImageClip
+    - Force canvas ke 9:16 (1080x1920) via letterbox
+    - Panel + teks (Pillow → numpy → ImageClip)
     """
     clip = VideoFileClip(bg_path)
     duration = min(float(clip.duration), float(target_duration))
-    sub = clip.subclip(0, duration)
-    W, H = sub.size
+    base = clip.subclip(0, duration)
+    # Fit ke kanvas 9:16
+    sub = fit_to_canvas(base, CANVAS_W, CANVAS_H)
+
+    W, H = CANVAS_W, CANVAS_H
 
     # Panel gelap
     panel_h = int(H * 0.32)
@@ -210,15 +220,16 @@ def render_video_with_overlay(bg_path: str, overlay_lines: List[str],
              .set_opacity(0.35).set_duration(sub.duration)
              .set_position(("center", panel_y - panel_h // 2)))
 
-    # Teks overlay (gabung lines)
+    # Teks overlay
     joined = "\n".join(overlay_lines)
     fontsize = max(28, int(H * 0.04))
     text_box_w = int(W * 0.88)
     text_box_h = panel_h - int(panel_h*0.2)
+
     text_img = _text_image(joined, text_box_w, text_box_h, fontsize, align="center",
                            stroke_w=max(1, fontsize//14))
-
-    text_clip = (ImageClip(text_img)
+    text_np = np.array(text_img)  # <-- FIX: konversi ke numpy array
+    text_clip = (ImageClip(text_np)
                  .set_duration(sub.duration)
                  .set_position(("center", panel_y - _tc_height_guess(panel_h))))
 
@@ -227,7 +238,8 @@ def render_video_with_overlay(bg_path: str, overlay_lines: List[str],
     cred_box_w, cred_box_h = int(W * 0.5), int(H * 0.06)
     cred_img = _text_image(credits, cred_box_w, cred_box_h, credit_font, align="left",
                            stroke_w=max(1, credit_font//10))
-    cred_clip = (ImageClip(cred_img)
+    cred_np = np.array(cred_img)  # <-- FIX: konversi ke numpy array
+    cred_clip = (ImageClip(cred_np)
                  .set_duration(sub.duration)
                  .set_position((int(W*0.02), int(H*0.94) - cred_box_h)))
 
@@ -254,7 +266,8 @@ def _build_menu(chat_id:int) -> Tuple[str, InlineKeyboardMarkup]:
             f"- Mode: `{mode}`\n"
             f"- Bahasa: `{lang}`\n"
             f"- Durasi: `{dur}s`\n"
-            f"- Variants: `{var}`\n\n"
+            f"- Variants: `{var}`\n"
+            f"- Canvas: `{CANVAS_W}x{CANVAS_H}` (9:16)\n\n"
             f"Tekan tombol untuk mengubah, lalu **Render ▶️**.")
 
     kb = [
@@ -277,10 +290,12 @@ def _build_menu(chat_id:int) -> Tuple[str, InlineKeyboardMarkup]:
 # ---------- Telegram handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    # reset state (kembali ke awal)
-    SESSION.pop(chat_id, None)
-    await update.message.reply_text("👋 Halo! Kirim video MP4 untuk dijadikan background.\n"
-                                    "Setelah terkirim, kamu akan dapat menu tombol.")
+    SESSION.pop(chat_id, None)  # reset
+    await update.message.reply_text(
+        "👋 Halo! Kirim video MP4 untuk dijadikan background.\n"
+        f"Bot akan auto-resize ke 9:16 ({CANVAS_W}x{CANVAS_H}).\n"
+        "Setelah terkirim, kamu akan dapat menu tombol."
+    )
 
 async def save_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -303,49 +318,62 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     chat_id = q.message.chat_id
 
-    # pastikan video ada
     if not SESSION.get(chat_id) or not os.path.exists(SESSION[chat_id].get("video_path","")):
-        return await q.edit_message_text("❌ Belum ada video. Kirim video MP4 dulu.")
+        try:
+            return await q.edit_message_text("❌ Belum ada video. Kirim video MP4 dulu.")
+        except: return
 
     data = q.data.split(":")
-    if data[0] == "set":
-        _, key, val = data
-        if key == "mode": SESSION[chat_id]["mode"] = val
-        elif key == "lang": SESSION[chat_id]["lang"] = val
-        elif key == "dur":  SESSION[chat_id]["dur"]  = max(20, min(90, int(val)))
-        elif key == "var":  SESSION[chat_id]["variants"] = max(3, min(5, int(val)))
-        text, kb = _build_menu(chat_id)
-        await q.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
-        return
+    try:
+        if data[0] == "set":
+            _, key, val = data
+            if key == "mode": SESSION[chat_id]["mode"] = val
+            elif key == "lang": SESSION[chat_id]["lang"] = val
+            elif key == "dur":  SESSION[chat_id]["dur"]  = max(20, min(90, int(val)))
+            elif key == "var":  SESSION[chat_id]["variants"] = max(3, min(5, int(val)))
+            text, kb = _build_menu(chat_id)
+            # Hindari error "message is not modified"
+            if q.message.text != text:
+                await q.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+            else:
+                await q.edit_message_reply_markup(reply_markup=kb)
+            return
 
-    if data[0] == "reset":
-        # kembali ke awal menu (tetap simpan video)
-        _init_defaults(chat_id)
-        text, kb = _build_menu(chat_id)
-        await q.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
-        return
+        if data[0] == "reset":
+            _init_defaults(chat_id)
+            text, kb = _build_menu(chat_id)
+            if q.message.text != text:
+                await q.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+            else:
+                await q.edit_message_reply_markup(reply_markup=kb)
+            return
 
-    if data[0] == "go":
-        st = SESSION[chat_id]
-        job = {
-            "chat_id": chat_id,
-            "bg_path": st["video_path"],
-            "mode": st["mode"],
-            "lang": st["lang"],
-            "dur":  int(st["dur"]),
-            "variants": int(st["variants"]),
-        }
-        await JOB_QUEUE.put(job)
-        await q.edit_message_text(
-            f"🧾 Job ditambahkan: {job['mode']}/{job['lang']}, dur={job['dur']}s, variants={job['variants']}\n"
-            f"Menunggu giliran di antrian..."
-        )
+        if data[0] == "go":
+            st = SESSION[chat_id]
+            job = {
+                "chat_id": chat_id,
+                "bg_path": st["video_path"],
+                "mode": st["mode"],
+                "lang": st["lang"],
+                "dur":  int(st["dur"]),
+                "variants": int(st["variants"]),
+            }
+            await JOB_QUEUE.put(job)
+            await q.edit_message_text(
+                f"🧾 Job ditambahkan: {job['mode']}/{job['lang']}, dur={job['dur']}s, variants={job['variants']}\n"
+                f"Menunggu giliran di antrian..."
+            )
 
-        global WORKER_STARTED
-        if not WORKER_STARTED:
-            WORKER_STARTED = True
-            asyncio.create_task(worker(context.application))
-        return
+            global WORKER_STARTED
+            if not WORKER_STARTED:
+                WORKER_STARTED = True
+                asyncio.create_task(worker(context.application))
+            return
+    except Exception as e:
+        try:
+            await q.edit_message_text(f"❌ Error: {e}")
+        except:
+            pass
 
 async def worker(app: Application):
     while True:
@@ -366,7 +394,6 @@ async def worker(app: Application):
                             limit=2
                         )
                     except: pass
-                # unique by url
                 sources=[]; seen=set()
                 for n in news:
                     u=n.get("url")
@@ -422,7 +449,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, save_video))
     app.add_handler(CallbackQueryHandler(on_button))
-    print(f"Bot running... (Gemini model: {GEMINI_MODEL})")
+    print(f"Bot running... (Gemini model: {GEMINI_MODEL}; canvas {CANVAS_W}x{CANVAS_H})")
     app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
